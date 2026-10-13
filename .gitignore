@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+.pytest_cache/
+build/
+third_party/
+models/
+*.gguf
+*.nram
+onram-backend.log
+*.tmp
