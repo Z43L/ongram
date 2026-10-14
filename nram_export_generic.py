@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -12,20 +13,45 @@ from nram_merge_generic import merge
 ROOT = Path(__file__).resolve().parent
 
 
+def _llama_cpp_dir() -> Path:
+    candidates = []
+    if os.environ.get("ONRAM_LLAMA_CPP_DIR"):
+        candidates.append(Path(os.environ["ONRAM_LLAMA_CPP_DIR"]))
+    candidates.extend((ROOT / "third_party" / "llama.cpp",
+                      ROOT.parent.parent / "deps" / "llama.cpp"))
+    for candidate in candidates:
+        if (candidate / "convert_hf_to_gguf.py").is_file():
+            return candidate
+    raise FileNotFoundError(
+        "llama.cpp converter not found; run `./onram runtime-setup` or set ONRAM_LLAMA_CPP_DIR"
+    )
+
+
+def _quantizer() -> Path:
+    candidates = [ROOT / "build" / "bin" / "llama-quantize",
+                  ROOT.parent.parent / "deps" / "llama.cpp" / "build" / "bin" / "llama-quantize"]
+    if os.environ.get("ONRAM_LLAMA_CPP_DIR"):
+        candidates.insert(0, Path(os.environ["ONRAM_LLAMA_CPP_DIR"]) / "build" / "bin" / "llama-quantize")
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    raise FileNotFoundError(
+        "llama-quantize not found; run `./onram runtime-setup` or set ONRAM_LLAMA_CPP_DIR"
+    )
+
+
 def export(bundle: Path, prefix: Path, *, model: str | None = None,
            tokenizer: str | None = None, quantization: str | None = "Q4_K_M",
            trust_remote_code: bool = False) -> list[Path]:
     hf_dir = prefix.with_name(prefix.name + "-hf")
     f16_file = prefix.with_name(prefix.name + "-f16.gguf")
     merge(bundle, hf_dir, model, tokenizer, trust_remote_code)
-    converter = ROOT / "third_party" / "llama.cpp" / "convert_hf_to_gguf.py"
+    converter = _llama_cpp_dir() / "convert_hf_to_gguf.py"
     subprocess.run([sys.executable, str(converter), str(hf_dir), "--outfile", str(f16_file),
                     "--outtype", "f16"], cwd=ROOT, check=True)
     outputs = [f16_file]
     if quantization:
-        quantizer = ROOT / "build" / "bin" / "llama-quantize"
-        if not quantizer.is_file():
-            raise FileNotFoundError("llama-quantize missing; build llama.cpp quantize target first")
+        quantizer = _quantizer()
         q_file = prefix.with_name(f"{prefix.name}-{quantization}.gguf")
         subprocess.run([str(quantizer), str(f16_file), str(q_file), quantization], cwd=ROOT, check=True)
         outputs.append(q_file)

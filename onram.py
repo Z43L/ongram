@@ -9,13 +9,16 @@ Ollama.
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import os
 import re
+import shutil
 import subprocess
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -26,7 +29,19 @@ ROOT = Path(__file__).resolve().parent
 MODEL_POINTER = ROOT / "models" / "onram-current.gguf"
 DEFAULT_MODEL = MODEL_POINTER
 DEFAULT_BUNDLE = ROOT / "models" / "distilgpt2-nra-qa.nram"
-DEFAULT_LLAMA_SERVER = ROOT / "build" / "bin" / "llama-server"
+def _default_llama_server() -> Path:
+    candidates = []
+    if os.environ.get("ONRAM_LLAMA_SERVER"):
+        candidates.append(Path(os.environ["ONRAM_LLAMA_SERVER"]))
+    candidates.extend((ROOT / "build" / "bin" / "llama-server",
+                       ROOT.parent.parent / "deps" / "llama.cpp" / "build" / "bin" / "llama-server"))
+    discovered = shutil.which("llama-server")
+    if discovered:
+        candidates.append(Path(discovered))
+    return next((path for path in candidates if path.is_file()), candidates[0])
+
+
+DEFAULT_LLAMA_SERVER = _default_llama_server()
 ALLOWED_DATASETS = {
     "nra_qa_train.jsonl",
     "nra_qa_validation.jsonl",
@@ -37,7 +52,7 @@ ALLOWED_DATASETS = {
 class Onram:
     def __init__(self, model_path: Path, llama_server: Path, host: str, port: int,
                  backend_port: int, bundle: Path, api_key: str | None = None,
-                 model_name: str | None = None):
+                 model_name: str | None = None, ctx_size: int = 0):
         self._stable_model_alias = model_name or ("distilgpt2-nram:latest" if model_path.name == MODEL_POINTER.name else None)
         self.model_path = model_path.resolve()
         self.llama_server = llama_server.resolve()
@@ -45,6 +60,7 @@ class Onram:
         self.port = port
         self.backend_port = backend_port
         self.bundle = bundle.resolve()
+        self.ctx_size = ctx_size
         self.model_pointer = MODEL_POINTER if model_path.name == MODEL_POINTER.name else self.bundle.with_name(self.bundle.stem + "-current.gguf")
         self.api_key = api_key
         self.backend: subprocess.Popen[str] | None = None
@@ -71,14 +87,13 @@ class Onram:
             raise FileNotFoundError(f"GGUF not found: {self.model_path}")
         if not self.llama_server.is_file():
             raise FileNotFoundError(
-                f"llama-server not found: {self.llama_server}. Build it with "
-                "`./.venv/bin/cmake -S third_party/llama.cpp -B build "
-                "-DLLAMA_BUILD_SERVER=ON -DLLAMA_CURL=OFF && "
-                "./.venv/bin/cmake --build build --target llama-server -j2`."
+                f"llama-server not found: {self.llama_server}. Build it with `./onram runtime-setup` "
+                "or pass --llama-server /path/to/llama-server."
             )
         self.backend = subprocess.Popen(
             [str(self.llama_server), "--model", str(self.model_path), "--host", "127.0.0.1",
-             "--port", str(self.backend_port), "--ctx-size", "512", "--parallel", "1"],
+             "--port", str(self.backend_port), "--ctx-size", str(self.ctx_size), "--parallel", "1",
+             "--alias", self.model_name, "--jinja"],
             cwd=ROOT,
             stdout=self.backend_log,
             stderr=subprocess.STDOUT,
@@ -308,17 +323,108 @@ def handler_for(app: Onram):
 
         def _read_json(self) -> dict[str, Any]:
             length = int(self.headers.get("Content-Length", "0"))
-            if length > 2_000_000:
-                raise ValueError("request body exceeds 2 MB")
+            if length > 64_000_000:
+                raise ValueError("request body exceeds 64 MB")
             value = json.loads(self.rfile.read(length) or b"{}")
             if not isinstance(value, dict):
                 raise ValueError("request body must be a JSON object")
             return value
 
+        def _read_proxy_body(self) -> bytes | None:
+            raw_length = self.headers.get("Content-Length")
+            if raw_length is None:
+                return None
+            try:
+                length = int(raw_length)
+            except ValueError as exc:
+                raise ValueError("invalid Content-Length") from exc
+            if length < 0 or length > 64_000_000:
+                raise ValueError("request body must be between 0 and 64 MB")
+            return self.rfile.read(length)
+
+        @staticmethod
+        def _proxy_paths() -> set[str]:
+            # Keep this list explicit: Onram exposes the inference APIs used by
+            # coding agents, not llama.cpp's administrative/model-loading API.
+            return {
+                "/v1/chat/completions",
+                "/v1/chat/completions/control",
+                "/v1/chat/completions/input_tokens",
+                "/v1/responses",
+                "/v1/responses/input_tokens",
+                "/v1/messages",
+                "/v1/messages/count_tokens",
+            }
+
+        def _proxy_request(self, method: str, body: bytes | None = None) -> None:
+            # Preserve protocol-specific headers (Anthropic version/beta,
+            # content negotiation, bearer/API-key auth) while stripping
+            # hop-by-hop headers that belong to the client connection.
+            hop_by_hop = {
+                "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+                "te", "trailers", "transfer-encoding", "upgrade", "host", "content-length",
+                "accept-encoding",
+            }
+            connection_tokens = {
+                token.strip().lower()
+                for value in self.headers.get_all("Connection", [])
+                for token in value.split(",")
+                if token.strip()
+            }
+            headers = {"Accept-Encoding": "identity"}
+            for key, value in self.headers.items():
+                if key.lower() not in hop_by_hop | connection_tokens:
+                    headers[key] = value
+            request = urllib.request.Request(
+                app.backend_url + self.path, data=body, headers=headers, method=method
+            )
+            with app.lock:
+                try:
+                    upstream = urllib.request.urlopen(request, timeout=24 * 60 * 60)
+                except urllib.error.HTTPError as exc:
+                    upstream = exc
+                except (urllib.error.URLError, TimeoutError, OSError) as exc:
+                    self._json({"error": f"llama-server unavailable: {exc}"}, 502)
+                    return
+
+                with upstream:
+                    self.send_response(upstream.status)
+                    has_content_length = False
+                    for key, value in upstream.headers.items():
+                        if key.lower() in {
+                            "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+                            "te", "trailers", "transfer-encoding", "upgrade",
+                        }:
+                            continue
+                        if key.lower() == "content-length":
+                            has_content_length = True
+                        self.send_header(key, value)
+                    if not has_content_length:
+                        # The backend's chunk framing has been removed by urllib.
+                        # Close-delimited HTTP/1.0 responses preserve SSE incrementally.
+                        self.send_header("Connection", "close")
+                        self.close_connection = True
+                    self.end_headers()
+                    try:
+                        while True:
+                            read_chunk = getattr(upstream, "read1", upstream.read)
+                            chunk = read_chunk(16_384)
+                            if not chunk:
+                                break
+                            self.wfile.write(chunk)
+                            self.wfile.flush()
+                    except (BrokenPipeError, ConnectionResetError, http.client.HTTPException, OSError):
+                        # A client cancelling a generation should stop consuming
+                        # the local response without crashing the HTTP worker.
+                        self.close_connection = True
+
         def _authorized(self) -> bool:
             if not app.api_key:
                 return True
-            return self.headers.get("Authorization") == f"Bearer {app.api_key}"
+            authorization = self.headers.get("Authorization", "")
+            bearer = authorization[7:].strip() if authorization.lower().startswith("bearer ") else ""
+            api_key = self.headers.get("x-api-key", "")
+            return bearer == app.api_key or api_key == app.api_key
 
         def do_GET(self) -> None:
             try:
@@ -330,6 +436,17 @@ def handler_for(app: Onram):
                     return self._json(app.status())
                 if self.path == "/api/evolve/status":
                     return self._json(app.status()["evolution"])
+                if self.path == "/v1/models":
+                    return self._json({"object": "list", "data": [{
+                        "id": app.model_name,
+                        "object": "model",
+                        "created": int(datetime.fromtimestamp(app.model_path.stat().st_mtime, timezone.utc).timestamp()),
+                        "owned_by": "onram",
+                    }]})
+                if self.path == "/models":
+                    return self._json({"object": "list", "data": [{
+                        "id": app.model_name, "object": "model", "owned_by": "onram",
+                    }]})
                 if self.path == "/api/ps":
                     return self._json({"models": [{"name": app.model_name, "model": app.model_name,
                         "size": app.model_path.stat().st_size, "digest": "local-gguf",
@@ -350,6 +467,9 @@ def handler_for(app: Onram):
             try:
                 if not self._authorized():
                     return self._json({"error": "unauthorized"}, 401)
+                path = urllib.parse.urlsplit(self.path).path
+                if path in self._proxy_paths():
+                    return self._proxy_request("POST", self._read_proxy_body())
                 body = self._read_json()
                 if self.path in ("/api/generate", "/api/chat"):
                     if body.get("model") not in (None, "", app.model_name, "distilgpt2-nram"):
@@ -435,16 +555,20 @@ def main() -> None:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=11434)
     parser.add_argument("--backend-port", type=int, default=11436)
+    parser.add_argument("--ctx-size", type=int, default=0,
+                        help="llama.cpp context size; 0 uses the GGUF's model default")
     parser.add_argument("--api-key", default=os.environ.get("ONRAM_API_KEY"))
     parser.add_argument("--model-name", help="Stable model name exposed by /api/tags")
     args = parser.parse_args()
     if args.host not in ("127.0.0.1", "localhost", "::1") and not args.api_key:
         parser.error("binding to a non-local address requires --api-key or ONRAM_API_KEY")
+    if args.ctx_size < 0:
+        parser.error("--ctx-size must be 0 or greater")
     model_name = args.model_name
     if model_name and ":" not in model_name:
         model_name += ":latest"
     app = Onram(args.model, args.llama_server, args.host, args.port, args.backend_port,
-                args.bundle, args.api_key, model_name)
+                args.bundle, args.api_key, model_name, args.ctx_size)
     app.start_backend()
     server = ThreadingHTTPServer((args.host, args.port), handler_for(app))
     print(f"onram listening at http://{args.host}:{args.port} with {app.model_path.name}", flush=True)

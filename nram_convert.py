@@ -6,20 +6,23 @@ import argparse
 import json
 from pathlib import Path
 
-from transformers import AutoTokenizer
-
 from nram_container import save_bundle
-from nram_generic import adapter_tensors, attach_adapters, discover_targets, load_base_model, weight_fingerprint
+from nram_generic import (adapter_tensors, attach_adapters, discover_targets,
+                          load_base_model, load_tokenizer, weight_fingerprint)
 
 
 def convert(args: argparse.Namespace) -> dict:
     model = load_base_model(args.model, revision=args.revision,
-                            trust_remote_code=args.trust_remote_code)
+                            trust_remote_code=args.trust_remote_code,
+                            dtype=args.dtype)
     revision = args.revision or getattr(model.config, "_commit_hash", None)
     # A trainable causal-LM needs a matching tokenizer; fail early if the source
     # is only a tensor dump without tokenizer/config metadata.
-    tokenizer = AutoTokenizer.from_pretrained(
-        args.tokenizer or args.model, revision=args.tokenizer_revision or (revision if not args.tokenizer else None),
+    source = str(Path(args.model).resolve()) if Path(args.model).exists() else args.model
+    tokenizer_source = args.tokenizer or source
+    tokenizer_revision = args.tokenizer_revision or (revision if not args.tokenizer else None)
+    tokenizer = load_tokenizer(
+        tokenizer_source, revision=tokenizer_revision,
         trust_remote_code=args.trust_remote_code,
     )
     target_layouts = discover_targets(model, last_k_blocks=args.last_k_blocks,
@@ -29,7 +32,6 @@ def convert(args: argparse.Namespace) -> dict:
     adapters = attach_adapters(model, target_layouts, args.rank, args.alpha)
     trainable = sum(parameter.numel() for adapter in adapters.values()
                     for parameter in adapter.parameters() if parameter.requires_grad)
-    source = str(Path(args.model).resolve()) if Path(args.model).exists() else args.model
     manifest = {
         "model_family": "hf-causal-lm-dense-lora",
         "model_name": Path(args.output).stem,
@@ -39,9 +41,11 @@ def convert(args: argparse.Namespace) -> dict:
             "revision": revision,
             "model_type": getattr(model.config, "model_type", "unknown"),
             "architectures": getattr(model.config, "architectures", None),
+            "compute_dtype": args.dtype,
+            "source_kind": "nram-v1-base-only" if Path(source).is_file() and Path(source).suffix == ".nram" else "transformers-checkpoint",
             "weights_sha256": weight_fingerprint(args.model),
-            "tokenizer_source": args.tokenizer or source,
-            "tokenizer_revision": args.tokenizer_revision or (revision if not args.tokenizer else None),
+            "tokenizer_source": tokenizer_source,
+            "tokenizer_revision": tokenizer_revision,
         },
         "adapter": {
             "kind": "LoRA",
@@ -62,7 +66,7 @@ def convert(args: argparse.Namespace) -> dict:
     save_bundle(args.output, manifest, adapter_tensors(adapters))
     return {"output": str(args.output), "model_type": manifest["base_model"]["model_type"],
             "revision": revision, "targets": list(target_layouts), "trainable_parameters": trainable,
-            "rank": args.rank, "alpha": args.alpha, "format_version": 2}
+            "rank": args.rank, "alpha": args.alpha, "compute_dtype": args.dtype, "format_version": 2}
 
 
 def main() -> None:
@@ -71,6 +75,8 @@ def main() -> None:
     parser.add_argument("--tokenizer", help="Tokenizer ID/path if different from --model")
     parser.add_argument("--tokenizer-revision", help="Pinned tokenizer revision when --tokenizer is separate")
     parser.add_argument("--revision", help="Pinned Hub branch, tag, or commit")
+    parser.add_argument("--dtype", choices=("float32", "float16", "bfloat16"), default="float32",
+                        help="Frozen base/LoRA storage dtype; use bfloat16 to reduce memory on supported hardware")
     parser.add_argument("--output", type=Path, required=True, help="Output .nram bundle")
     parser.add_argument("--rank", type=int, default=4)
     parser.add_argument("--alpha", type=float, default=8.0)
