@@ -37,7 +37,30 @@ directly:
 ./build/onram-cli convert --help
 ./build/onram-cli nram info models/Gemma4-E2B-NRA.nram
 ./build/onram-cli nram-eval --help
+./build/onram-cli launch --help
 ```
+
+In one terminal, start the Onram API with a coding model:
+
+```sh
+./onram serve --model /path/to/coder-model.gguf --model-name local-coder
+```
+
+In another terminal, launch an installed agent through its native protocol
+adapter (choose one):
+
+```sh
+./onram launch claude
+./onram launch codex --model local-coder:latest
+./onram launch pi -- --print "Review this repository"
+```
+
+`launch` checks `/v1/models` and selects its first model by default; `--model`
+or `ONRAM_MODEL` overrides it. `--base-url` or `ONRAM_BASE_URL` selects another
+Onram instance, and `ONRAM_API_KEY` is forwarded as the local provider
+credential. Put agent-specific arguments after `--`. For Pi, the command adds
+or updates the `onram` provider in `PI_CODING_AGENT_DIR/models.json` (default
+`~/.pi/agent/models.json`) and preserves the other providers.
 
 For compatibility, `./onram --model ...` and `./onram --bundle ...` still
 start the HTTP server; explicit `./onram serve ...` does the same. The launcher
