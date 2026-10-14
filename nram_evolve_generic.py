@@ -11,9 +11,7 @@ from typing import Any
 
 import torch
 from torch import nn
-from transformers import AutoTokenizer
-
-from nram_generic import load_nram_model, save_accepted_bundle
+from nram_generic import load_nram_model, load_tokenizer, save_accepted_bundle
 
 
 def read_jsonl(path: Path) -> list[dict[str, str]]:
@@ -115,7 +113,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     )
     base = manifest["base_model"]
     tokenizer_source = args.tokenizer or base.get("tokenizer_source") or base["source"]
-    tokenizer = AutoTokenizer.from_pretrained(
+    tokenizer = load_tokenizer(
         tokenizer_source, revision=base.get("tokenizer_revision", base.get("revision")),
         local_files_only=args.local_files_only,
         trust_remote_code=args.trust_remote_code,

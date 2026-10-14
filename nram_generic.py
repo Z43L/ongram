@@ -8,13 +8,15 @@ from __future__ import annotations
 
 import hashlib
 import re
+import sys
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 import torch
 from torch import nn
 from torch.nn import functional as F
-from transformers import AutoModelForCausalLM
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from nram_container import load_bundle, save_bundle
 
@@ -27,6 +29,38 @@ PROJECTION_LEAVES = {
     "w3", "wi", "wi_0", "wi_1", "wo",
 }
 EXCLUDED_PARTS = {"lm_head", "embed_tokens", "word_embeddings", "wte", "wpe", "classifier"}
+NRAM_V2_MAGIC = b"NRAM\x00\x02"
+
+
+@contextmanager
+def _transformers_source(source: str | Path) -> Iterator[str | Path]:
+    """Open a Transformers directory or a workspace NRAM v1 base tensor bank."""
+    path = Path(source)
+    if path.is_file() and path.suffix == ".nram":
+        with path.open("rb") as stream:
+            prefix = stream.read(len(NRAM_V2_MAGIC))
+        if prefix == NRAM_V2_MAGIC:
+            raise ValueError("An adapter-only NRAM v2 bundle cannot be used as a base checkpoint")
+        workspace = Path(__file__).resolve().parents[2]
+        if str(workspace) not in sys.path:
+            sys.path.insert(0, str(workspace))
+        from nra_m.nram import materialize_runtime_view
+
+        with materialize_runtime_view(path) as (model_dir, _manifest, _route):
+            # NRAM v1's append-only graph, memory, and deltas are not applied
+            # here: this bridge intentionally exposes its immutable base tensors.
+            yield model_dir
+        return
+    yield source
+
+
+def load_tokenizer(source: str | Path, *, revision: str | None = None,
+                   local_files_only: bool = False, trust_remote_code: bool = False):
+    with _transformers_source(source) as local_source:
+        return AutoTokenizer.from_pretrained(
+            str(local_source), revision=revision, local_files_only=local_files_only,
+            trust_remote_code=trust_remote_code,
+        )
 
 
 def module_layout(module: nn.Module) -> str | None:
@@ -155,16 +189,32 @@ def merge_adapters(model: nn.Module, adapters: dict[str, LoRAProjection]) -> Non
 
 
 def load_base_model(source: str | Path, *, revision: str | None = None, local_files_only: bool = False,
-                    trust_remote_code: bool = False) -> nn.Module:
-    model = AutoModelForCausalLM.from_pretrained(
-        str(source), local_files_only=local_files_only, trust_remote_code=trust_remote_code,
-        dtype=torch.float32, revision=revision,
-    )
-    return model
+                    trust_remote_code: bool = False, dtype: str | torch.dtype = "float32") -> nn.Module:
+    dtypes = {"float32": torch.float32, "float16": torch.float16, "bfloat16": torch.bfloat16}
+    model_dtype = dtypes.get(dtype) if isinstance(dtype, str) else dtype
+    if model_dtype not in dtypes.values():
+        raise ValueError("dtype must be float32, float16, or bfloat16")
+    with _transformers_source(source) as local_source:
+        return AutoModelForCausalLM.from_pretrained(
+            str(local_source), local_files_only=local_files_only, trust_remote_code=trust_remote_code,
+            dtype=model_dtype, revision=revision,
+        )
 
 
 def weight_fingerprint(source: str | Path) -> str | None:
     path = Path(source)
+    if path.is_file() and path.suffix == ".nram":
+        with path.open("rb") as stream:
+            prefix = stream.read(len(NRAM_V2_MAGIC))
+        if prefix == NRAM_V2_MAGIC:
+            return None
+        workspace = Path(__file__).resolve().parents[2]
+        if str(workspace) not in sys.path:
+            sys.path.insert(0, str(workspace))
+        from nra_m.nram import read_manifest_and_route
+
+        _info, manifest, _records, _route = read_manifest_and_route(path)
+        return str(manifest["base_sha256"])
     if not path.is_dir():
         return None
     files = sorted(p for p in path.rglob("*") if p.is_file() and
@@ -190,7 +240,8 @@ def load_nram_model(bundle_path: str | Path, source: str | Path | None = None, *
     base = manifest["base_model"]
     source = str(source or base["source"])
     model = load_base_model(source, revision=base.get("revision"), local_files_only=local_files_only,
-                            trust_remote_code=trust_remote_code)
+                            trust_remote_code=trust_remote_code,
+                            dtype=base.get("compute_dtype", "float32"))
     expected_hash = base.get("weights_sha256")
     actual_hash = weight_fingerprint(source)
     if expected_hash and actual_hash and expected_hash != actual_hash:

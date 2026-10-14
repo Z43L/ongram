@@ -23,6 +23,54 @@ ln -s onram-bootstrap-Q4_K_M.gguf models/onram-current.gguf
 ./onram --bundle models/distilgpt2-nra-qa.nram
 ```
 
+## Unified Onram command
+
+The adapted `onram` command is the single entry point for the upstream
+utilities and the workspace's Gemma NRA-M tools. Build its small native
+launcher once, then use subcommands instead of invoking utility scripts
+directly:
+
+```sh
+./build_onram.sh
+./build/onram-cli --help
+./build/onram-cli test
+./build/onram-cli convert --help
+./build/onram-cli nram info models/Gemma4-E2B-NRA.nram
+./build/onram-cli nram-eval --help
+```
+
+For compatibility, `./onram --model ...` and `./onram --bundle ...` still
+start the HTTP server; explicit `./onram serve ...` does the same. The launcher
+can select the Python environment through `ONRAM_PYTHON`, otherwise it uses
+this checkout's `.venv`, the parent workspace's `.venv-gemma4`, or `python3`.
+
+The native launcher is a command dispatcher, not a self-contained model
+runtime. Python dependencies, checkpoint files, and the `llama-server`
+executable remain separate runtime requirements. The upstream v2 LoRA bundles
+also remain a distinct format from the workspace's Gemma `.nram` v1 packages;
+the `nram*` commands operate on v1 and the upstream training/export commands
+operate on v2.
+
+For this workspace, requirements use Transformers 5.19.0 so the generic path
+can load the locally tested Gemma 4 architecture. A v1 Gemma package can serve
+as the frozen base for a v2 LoRA experiment:
+
+```sh
+./onram convert --model ../../models/Gemma4-E2B-NRA.nram \
+  --dtype bfloat16 --rank 4 --output models/gemma4-adapter.nram
+./onram infer-generic "Answer briefly: what is a recurrent neural state?" \
+  --bundle models/gemma4-adapter.nram --local-files-only
+```
+
+This conversion loads the full base model and saves only a LoRA adapter in v2.
+It reads the v1 Safetensors tensor bank plus its tokenizer/config assets, but
+does not apply v1 routes, associative memory, or output deltas. It preserves
+Gemma's Transformer execution; it is not an architectural conversion to NRA-2.
+
+The clone snapshot does not include an upstream `LICENSE` file. It is kept in
+the workspace for internal research; clarify upstream licensing before
+redistributing the clone or derived binaries.
+
 The initial adapter is zero initialized, so the bootstrap GGUF is equivalent
 to the base checkpoint. Use `/api/evolve` with verified training examples to
 start changing it; Onram serves the current GGUF while validating candidates.
@@ -124,9 +172,9 @@ LoRA adapter leaves the original model output unchanged.
 `onram.py` is a small Ollama-shaped HTTP service around `llama-server`. It
 serves a local GGUF through `/api/generate` and `/api/chat`, and includes
 `/api/tags`, `/api/show`, `/api/ps`, and `/api/version`. It streams generation
-results in newline-delimited JSON. It is a prototype compatibility layer; it
-does not include Ollama's model registry/pull, Modelfile build, embeddings,
-vision, tools, cloud, or platform packaging features.
+results in newline-delimited JSON. It does not include Ollama's model
+registry/pull, Modelfile build, embeddings, cloud, or platform packaging
+features. Coding-agent API compatibility is described below.
 
 The local llama.cpp checkout can build its server without downloading UI
 assets:
@@ -175,6 +223,106 @@ generic Hugging Face causal-LM conversion and evolution workflow is documented
 below. Passing a different llama.cpp-compatible GGUF with `--model` changes
 inference only; an evolvable NRAM bundle must be created from trainable source
 weights. Binding to a non-local address requires `--api-key` or `ONRAM_API_KEY`.
+
+## Coding-agent API proxy
+
+Onram also exposes the local model through the API formats used by Claude Code,
+Codex, and Pi. Requests and streaming responses are relayed to llama.cpp without
+rewriting their JSON or SSE events, preserving tool declarations and tool
+results. The supported routes are:
+
+- `POST /v1/messages` and `/v1/messages/count_tokens` for Anthropic Messages.
+- `POST /v1/responses` and `/v1/responses/input_tokens` for OpenAI Responses.
+- `POST /v1/chat/completions`, `/v1/chat/completions/control`, and
+  `/v1/chat/completions/input_tokens` for OpenAI Chat Completions.
+- `GET /v1/models` returns the active Onram model alias.
+
+Start the service with the GGUF and a stable ID for the coding agents:
+
+```sh
+./onram --model /path/to/coder-model.gguf --model-name local-coder
+```
+
+The model ID reported by `/v1/models` is then `local-coder:latest`. A bearer
+token or Anthropic `x-api-key` is accepted when `--api-key`/`ONRAM_API_KEY` is
+set. Without a key the server only binds to localhost by default.
+By default llama.cpp uses the GGUF's context setting; pass `--ctx-size N` to
+override it (larger contexts use more memory).
+
+### Claude Code
+
+Claude Code uses Anthropic Messages and supports a custom base URL. For a
+key-protected Onram instance:
+
+```sh
+export ANTHROPIC_BASE_URL=http://127.0.0.1:11434
+export ANTHROPIC_API_KEY="$ONRAM_API_KEY"
+export ANTHROPIC_MODEL=local-coder:latest
+claude
+```
+
+For a localhost-only instance without `--api-key`, set a dummy
+`ANTHROPIC_API_KEY=local-onram`; Onram ignores it when authentication is
+disabled. Anthropic's `ANTHROPIC_AUTH_TOKEN` can be used instead and is sent as
+a bearer token.
+
+### OpenAI Codex
+
+Codex uses the Responses API. Add a custom provider to `~/.codex/config.toml`:
+
+```toml
+model = "local-coder:latest"
+model_provider = "onram"
+
+[model_providers.onram]
+name = "Onram local"
+base_url = "http://127.0.0.1:11434/v1"
+wire_api = "responses"
+requires_openai_auth = false
+supports_websockets = false
+
+[model_providers.onram.capabilities]
+remote_compaction = "unsupported"
+```
+
+For a key-protected server, add `env_key = "ONRAM_API_KEY"` to that provider
+table and set the variable before starting Codex. Codex's HTTP Responses API works through this
+proxy; WebSocket transport and remote compaction are not provided. Codex's
+Responses API configuration is documented in the [Codex config
+reference](https://developers.openai.com/codex/config-reference/).
+
+### Pi
+
+Add a provider to `~/.pi/agent/models.json`:
+
+```json
+{
+  "$schema": "https://pi.dev/schemas/models.schema.json",
+  "providers": {
+    "onram": {
+      "baseUrl": "http://127.0.0.1:11434/v1",
+      "api": "openai-completions",
+      "apiKey": "${ONRAM_API_KEY}",
+      "models": [{ "id": "local-coder:latest" }]
+    }
+  }
+}
+```
+
+Pi requires an API key entry to make the custom model available. Use
+`"apiKey": "local-onram"` for an unauthenticated local server, or use
+`${ONRAM_API_KEY}` when Onram authentication is enabled. Pi's provider format
+is documented in [Choose a model](https://pi.dev/docs/latest/models).
+
+Claude Code's endpoint variables are documented in [LLM gateway
+configuration](https://code.claude.com/docs/en/llm-gateway).
+
+These routes provide protocol compatibility, not a guarantee that every model
+can act as a coding agent. Tool use depends on the GGUF's chat template and
+training; llama.cpp documents that tool calling requires a compatible Jinja
+template. Codex web search, remote compaction, and WebSocket transport are not
+implemented by this local proxy. Check the model's context limit before using
+large coding-agent conversations.
 
 ## Generic conversion for Hugging Face causal LMs
 

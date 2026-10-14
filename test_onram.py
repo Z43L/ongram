@@ -1,6 +1,13 @@
 import unittest
+import json
+import threading
+import urllib.error
+import urllib.request
 from pathlib import Path
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from types import SimpleNamespace
 from onram import Onram, ROOT
+from onram import handler_for
 
 
 class OnramTests(unittest.TestCase):
@@ -38,6 +45,125 @@ class OnramTests(unittest.TestCase):
         app = Onram.__new__(Onram)
         app.model_path = Path("/models/custom-instruct-f16.gguf")
         self.assertEqual(app.model_name, "custom-instruct-f16:latest")
+
+
+class OnramProxyTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        class BackendHandler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+            last_request = None
+
+            def log_message(self, fmt, *args):
+                pass
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", "0"))
+                type(self).last_request = {
+                    "path": self.path,
+                    "body": self.rfile.read(length),
+                    "headers": dict(self.headers.items()),
+                }
+                chunks = (
+                    b"event: message_start\n",
+                    b"data: {\"type\":\"message_start\"}\n\n",
+                )
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Transfer-Encoding", "chunked")
+                self.end_headers()
+                for chunk in chunks:
+                    self.wfile.write(f"{len(chunk):X}\r\n".encode() + chunk + b"\r\n")
+                    self.wfile.flush()
+                self.wfile.write(b"0\r\n\r\n")
+
+        cls.backend = ThreadingHTTPServer(("127.0.0.1", 0), BackendHandler)
+        cls.backend_thread = threading.Thread(target=cls.backend.serve_forever, daemon=True)
+        cls.backend_thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.backend.shutdown()
+        cls.backend.server_close()
+        cls.backend_thread.join(timeout=2)
+
+    def setUp(self):
+        backend_port = self.backend.server_address[1]
+        self.app = SimpleNamespace(
+            api_key="agent-secret",
+            backend_url=f"http://127.0.0.1:{backend_port}",
+            model_name="local-coder:latest",
+            model_path=Path(__file__).resolve(),
+            lock=threading.RLock(),
+        )
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), handler_for(self.app))
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.base_url = f"http://127.0.0.1:{self.server.server_address[1]}"
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+
+    def test_openai_models_lists_the_active_onram_alias(self):
+        request = urllib.request.Request(self.base_url + "/v1/models", headers={
+            "Authorization": "Bearer agent-secret",
+        })
+        with urllib.request.urlopen(request) as response:
+            listing = json.loads(response.read())
+        self.assertEqual(listing["data"][0]["id"], "local-coder:latest")
+        self.assertEqual(listing["data"][0]["owned_by"], "onram")
+
+    def test_agent_routes_preserve_protocol_bodies_and_sse_streams(self):
+        schema = {"type": "object", "properties": {"value": {"type": "string"}}}
+        cases = (
+            ("/v1/messages?beta=1", {"anthropic-version": "2023-06-01", "x-api-key": "agent-secret"}, {
+                "model": "local-coder:latest", "max_tokens": 24, "stream": True,
+                "messages": [{"role": "user", "content": "hello"}],
+                "tools": [{"name": "inspect", "description": "inspect", "input_schema": schema}],
+                "tool_choice": {"type": "auto"},
+            }),
+            ("/v1/responses", {"authorization": "Bearer agent-secret"}, {
+                "model": "local-coder:latest", "input": "hello", "stream": True,
+                "tools": [{"type": "function", "name": "inspect", "parameters": schema}],
+            }),
+            ("/v1/chat/completions", {"authorization": "Bearer agent-secret"}, {
+                "model": "local-coder:latest", "messages": [{"role": "user", "content": "hello"}],
+                "stream": True, "tools": [{"type": "function", "function": {
+                    "name": "inspect", "parameters": schema,
+                }}], "tool_choice": "auto",
+            }),
+        )
+        for path, headers, value in cases:
+            with self.subTest(path=path):
+                payload = json.dumps(value).encode()
+                request = urllib.request.Request(self.base_url + path, data=payload, headers={
+                    "Content-Type": "application/json", **headers,
+                })
+                with urllib.request.urlopen(request) as response:
+                    body = response.read()
+                self.assertEqual(response.headers.get_content_type(), "text/event-stream")
+                recorded = self.backend.RequestHandlerClass.last_request
+                expected_path = "/v1/messages?beta=1" if path.endswith("beta=1") else path
+                self.assertEqual(recorded["path"], expected_path)
+                self.assertEqual(recorded["body"], payload)
+                self.assertIn(b"event: message_start", body)
+
+    def test_configured_key_accepts_bearer_and_anthropic_x_api_key(self):
+        request = urllib.request.Request(self.base_url + "/v1/messages", data=b"{}", headers={
+            "Content-Type": "application/json", "x-api-key": "wrong",
+        })
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            urllib.request.urlopen(request)
+        self.assertEqual(caught.exception.code, 401)
+        caught.exception.close()
+
+        request = urllib.request.Request(self.base_url + "/v1/messages", data=b"{}", headers={
+            "Content-Type": "application/json", "x-api-key": "agent-secret",
+        })
+        with urllib.request.urlopen(request) as response:
+            self.assertEqual(response.status, 200)
 
 
 if __name__ == "__main__":

@@ -6,9 +6,9 @@ import argparse
 from pathlib import Path
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM
 
-from nram_generic import load_nram_model
+from nram_generic import load_nram_model, load_tokenizer
 
 
 def main() -> None:
@@ -21,7 +21,7 @@ def main() -> None:
     args = parser.parse_args()
     manifest, adapted, _ = load_nram_model(args.bundle, local_files_only=args.local_files_only)
     tokenizer_source = manifest["base_model"].get("tokenizer_source") or manifest["base_model"]["source"]
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_source,
+    tokenizer = load_tokenizer(tokenizer_source,
         revision=manifest["base_model"].get("tokenizer_revision", manifest["base_model"].get("revision")),
         local_files_only=args.local_files_only)
     merged = AutoModelForCausalLM.from_pretrained(args.merged, local_files_only=True).eval()

@@ -1,24 +1,27 @@
 #!/usr/bin/env bash
 set -euo pipefail
-cd "$(dirname "$0")"
 
-if [[ ! -d third_party/llama.cpp/.git ]]; then
-  mkdir -p third_party
-  git clone https://github.com/ggml-org/llama.cpp.git third_party/llama.cpp
-  git -C third_party/llama.cpp checkout 1b70350c92563449576bcbbf552994b1d1ed847d
-fi
-
-if ! rg -q 'yield from super\(\).modify_tensors\(data_torch, name, bid\)' third_party/llama.cpp/conversion/gpt2.py; then
-  :
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+cd "$SCRIPT_DIR"
+if [[ -n "${ONRAM_PYTHON:-}" ]]; then
+  PYTHON=$ONRAM_PYTHON
+elif [[ -x "$SCRIPT_DIR/.venv/bin/python" ]]; then
+  PYTHON=$SCRIPT_DIR/.venv/bin/python
+elif [[ -x "$SCRIPT_DIR/../../.venv-gemma4/bin/python" ]]; then
+  PYTHON=$SCRIPT_DIR/../../.venv-gemma4/bin/python
 else
-  (cd third_party/llama.cpp && git apply ../../patches/gpt2-skip-causal-mask.patch)
+  PYTHON=$(command -v python3)
+fi
+PYTHON=$(command -v "$PYTHON")
+
+LLAMA_DIR=${ONRAM_LLAMA_CPP_DIR:-"$SCRIPT_DIR/third_party/llama.cpp"}
+if [[ ! -f "$LLAMA_DIR/convert_hf_to_gguf.py" || ! -x "$SCRIPT_DIR/build/bin/llama-quantize" ]]; then
+  "$SCRIPT_DIR/setup_onram.sh"
 fi
 
-.venv/bin/cmake -S third_party/llama.cpp -B build \
-  -DGGML_CUDA=OFF -DLLAMA_BUILD_TESTS=OFF \
-  -DLLAMA_BUILD_EXAMPLES=ON -DLLAMA_BUILD_SERVER=OFF
-.venv/bin/cmake --build build --target llama-completion llama-quantize -j4
-.venv/bin/python third_party/llama.cpp/convert_hf_to_gguf.py \
-  models/distilgpt2 --outfile models/distilgpt2-f16.gguf --outtype f16
-build/bin/llama-quantize models/distilgpt2-f16.gguf \
-  models/distilgpt2-Q4_K_M.gguf Q4_K_M
+"$PYTHON" "$LLAMA_DIR/convert_hf_to_gguf.py" \
+  "$SCRIPT_DIR/models/distilgpt2" \
+  --outfile "$SCRIPT_DIR/models/distilgpt2-f16.gguf" --outtype f16
+"$SCRIPT_DIR/build/bin/llama-quantize" \
+  "$SCRIPT_DIR/models/distilgpt2-f16.gguf" \
+  "$SCRIPT_DIR/models/distilgpt2-Q4_K_M.gguf" Q4_K_M

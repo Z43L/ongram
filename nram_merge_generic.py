@@ -5,9 +5,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from transformers import AutoTokenizer
-
-from nram_generic import load_nram_model, merge_adapters
+from nram_generic import load_nram_model, load_tokenizer, merge_adapters
 
 
 def merge(bundle: Path, output: Path, model: str | None, tokenizer_source: str | None,
@@ -20,7 +18,7 @@ def merge(bundle: Path, output: Path, model: str | None, tokenizer_source: str |
     base.config.use_cache = True
     base.save_pretrained(output, safe_serialization=True)
     tok_source = tokenizer_source or manifest["base_model"].get("tokenizer_source") or manifest["base_model"]["source"]
-    tokenizer = AutoTokenizer.from_pretrained(
+    tokenizer = load_tokenizer(
         tok_source, revision=manifest["base_model"].get("tokenizer_revision", manifest["base_model"].get("revision")),
         trust_remote_code=trust_remote_code,
     )
