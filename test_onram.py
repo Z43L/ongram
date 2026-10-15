@@ -1,6 +1,8 @@
 import unittest
+import hashlib
 import json
 import threading
+import tempfile
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -8,6 +10,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import SimpleNamespace
 from onram import Onram, ROOT
 from onram import handler_for
+from interaction_learning import InteractionBuffer
 
 
 class OnramTests(unittest.TestCase):
@@ -45,6 +48,100 @@ class OnramTests(unittest.TestCase):
         app = Onram.__new__(Onram)
         app.model_path = Path("/models/custom-instruct-f16.gguf")
         self.assertEqual(app.model_name, "custom-instruct-f16:latest")
+
+    def test_gguf_trace_aggregates_layers_without_saving_conversation_text(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            app = Onram.__new__(Onram)
+            app.inference_debug = True
+            app.model_path = Path("/models/private-model-Q4_K_M.gguf")
+            app.trace_scratch = root / "scratch.jsonl"
+            app.trace_ledger = root / "ledger.jsonl"
+            app.debug_trace_count = 0
+            app.debug_status = {"enabled": True, "state": "capturing"}
+            app.trace_scratch.write_text("\n".join((
+                json.dumps({"layer": 0, "positions": 2, "hidden_size": 4,
+                            "output_rms": 2.0, "top_channels": [
+                                {"channel": 1, "mean_abs": 3.0},
+                            ]}),
+                json.dumps({"layer": 0, "positions": 1, "hidden_size": 4,
+                            "output_rms": 1.0, "top_channels": [
+                                {"channel": 1, "mean_abs": 1.0},
+                                {"channel": 2, "mean_abs": 2.0},
+                            ]}),
+                json.dumps({"layer": 1, "positions": 1, "hidden_size": 4,
+                            "output_rms": 0.5, "top_channels": []}),
+            )) + "\n", encoding="utf-8")
+            prompt = "Secreto de usuario: Ana-private-phrase"
+            completion = "Respuesta confidencial: output-private-phrase"
+            request = json.dumps({"messages": [{"role": "user", "content": prompt}]}).encode()
+            response = json.dumps({
+                "stop_reason": "end_turn",
+                "content": [{"type": "text", "text": completion}],
+            }).encode()
+
+            app.finish_runtime_trace("/v1/messages", request, response, 200)
+
+            report = json.loads(app.trace_ledger.read_text(encoding="utf-8"))
+            saved = app.trace_ledger.read_text(encoding="utf-8")
+            self.assertEqual(report["backend"], "llama.cpp-gguf")
+            self.assertEqual(report["callback_events"], 3)
+            self.assertEqual(report["layer_count"], 2)
+            self.assertAlmostEqual(report["layers"][0]["output_rms"], 3.0 ** 0.5)
+            self.assertEqual(report["layers"][0]["top_mean_abs_channels"][0], {
+                "channel": 1, "mean_abs": 7 / 3,
+            })
+            self.assertEqual(report["prompt_sha256"], hashlib.sha256(prompt.encode()).hexdigest())
+            self.assertEqual(report["completion_sha256"], hashlib.sha256(completion.encode()).hexdigest())
+            self.assertNotIn(prompt, saved)
+            self.assertNotIn(completion, saved)
+            self.assertNotIn("Ana-private-phrase", saved)
+            self.assertNotIn("output-private-phrase", saved)
+            self.assertEqual(app.debug_status["state"], "ready")
+            self.assertEqual(app.debug_status["trace_count"], 1)
+            self.assertEqual(app.trace_scratch.stat().st_size, 0)
+
+
+class OnramLearningFeedbackTests(unittest.TestCase):
+    def test_bad_trace_feedback_replaces_target_with_user_correction(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            prompt = "Implementa una función segura de ejemplo."
+            original = "La respuesta incorrecta propone eval(input())."
+            corrected = "Usa ast.literal_eval y valida estrictamente el tipo recibido."
+            learning = InteractionBuffer(root / "learning")
+            learning.add(prompt, original)
+            trace_id = "trace-bad-001"
+            app = Onram.__new__(Onram)
+            app.trace_ledger = root / "learning" / "inference-traces.jsonl"
+            app.trace_ledger.write_text(json.dumps({
+                "trace_id": trace_id,
+                "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
+                "completion_sha256": hashlib.sha256(original.encode()).hexdigest(),
+                "callback_events": 16,
+            }) + "\n", encoding="utf-8")
+            app.learning = learning
+            app.learning_lock = threading.Lock()
+            app.learning_status = {}
+            app.auto_learn = False
+
+            result = app.record_feedback({
+                "trace_id": trace_id, "rating": "bad",
+                "corrected_completion": corrected,
+            })
+
+            self.assertTrue(result["accepted"])
+            self.assertTrue(result["has_correction"])
+            self.assertEqual(result["corrected_bad_feedback_count"], 1)
+            train_path, validation_path = root / "train.jsonl", root / "validation.jsonl"
+            train_count, validation_count = learning.write_split(train_path, validation_path)
+            examples = [json.loads(line) for path in (train_path, validation_path)
+                        for line in path.read_text(encoding="utf-8").splitlines()]
+            self.assertEqual(train_count + validation_count, 1)
+            self.assertEqual(examples[0]["completion"], corrected)
+            self.assertEqual(examples[0]["runtime_feedback"], "bad_corrected")
+            self.assertEqual(examples[0]["runtime_trace_id"], trace_id)
+            self.assertNotIn(original, json.dumps(examples))
 
 
 class OnramProxyTests(unittest.TestCase):

@@ -128,18 +128,63 @@ class LoRAProjection(nn.Module):
             in_features, out_features = base.weight.shape
         else:
             raise ValueError(f"Unsupported weight layout: {layout}")
-        self.lora_A = nn.Parameter(torch.empty(rank, in_features, dtype=base.weight.dtype,
+        # Keep trainable adapter weights and AdamW state in FP32 even when the
+        # frozen base model is loaded in FP16. FP16 epsilon/gradient underflow
+        # on Apple MPS can otherwise turn a complete epoch into NaN losses.
+        self.lora_A = nn.Parameter(torch.empty(rank, in_features, dtype=torch.float32,
                                                device=base.weight.device))
-        self.lora_B = nn.Parameter(torch.zeros(out_features, rank, dtype=base.weight.dtype,
+        self.lora_B = nn.Parameter(torch.zeros(out_features, rank, dtype=torch.float32,
                                                device=base.weight.device))
         nn.init.kaiming_uniform_(self.lora_A, a=5**0.5)
         self.scale = float(alpha) / rank
+        self._trace_enabled = False
+        self._trace_values: dict[str, torch.Tensor | int] = {}
+
+    def start_attribution_trace(self) -> None:
+        self._trace_enabled = True
+        self._trace_values = {"input_sq": 0.0, "input_n": 0,
+                              "base_sq": 0.0, "delta_sq": 0.0, "output_n": 0}
+
+    def stop_attribution_trace(self) -> None:
+        self._trace_enabled = False
+
+    def attribution_trace(self) -> dict[str, float]:
+        values = self._trace_values
+        input_n = int(values.get("input_n", 0))
+        output_n = int(values.get("output_n", 0))
+        if not input_n or not output_n:
+            return {}
+
+        def scalar(name: str) -> float:
+            value = values[name]
+            return float(value.detach().cpu()) if isinstance(value, torch.Tensor) else float(value)
+
+        input_rms = (scalar("input_sq") / input_n) ** 0.5
+        base_rms = (scalar("base_sq") / output_n) ** 0.5
+        delta_rms = (scalar("delta_sq") / output_n) ** 0.5
+        return {"input_rms": input_rms, "base_output_rms": base_rms,
+                "adapter_delta_rms": delta_rms,
+                "relative_delta_rms": delta_rms / max(base_rms, 1e-12)}
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # F.linear's weight convention gives the same low-rank residual for
         # nn.Linear [out,in] and GPT-2 Conv1D [in,out].
-        residual = F.linear(F.linear(x, self.lora_A), self.lora_B) * self.scale
-        return self.base(x) + residual
+        base_output = self.base(x)
+        adapter_input = x.to(dtype=self.lora_A.dtype)
+        residual = F.linear(F.linear(adapter_input, self.lora_A), self.lora_B) * self.scale
+        if self._trace_enabled:
+            # Keep device-side scalar accumulators; reading each statistic back
+            # to Python in the forward pass would synchronize Metal/CUDA.
+            with torch.no_grad():
+                values = self._trace_values
+                for key, value in (("input_sq", x), ("base_sq", base_output),
+                                   ("delta_sq", residual)):
+                    total = value.detach().float().square().sum()
+                    previous = values[key]
+                    values[key] = previous + total if isinstance(previous, torch.Tensor) else total
+                values["input_n"] = int(values["input_n"]) + x.numel()
+                values["output_n"] = int(values["output_n"]) + residual.numel()
+        return base_output + residual.to(dtype=base_output.dtype)
 
 
 def _parent_and_leaf(root: nn.Module, path: str) -> tuple[nn.Module, str]:

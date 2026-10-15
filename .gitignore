@@ -7,4 +7,5 @@ models/
 *.gguf
 *.nram
 onram-backend.log
+onram-server.log
 *.tmp

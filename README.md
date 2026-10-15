@@ -44,6 +44,21 @@ start the HTTP server; explicit `./onram serve ...` does the same. The launcher
 can select the Python environment through `ONRAM_PYTHON`, otherwise it uses
 this checkout's `.venv`, the parent workspace's `.venv-gemma4`, or `python3`.
 
+The `launch` subcommand starts the local Llama 3.2 1B server with interaction learning
+enabled if it is not already serving that model, then starts a coding client:
+
+```sh
+./build/onram-cli launch claude
+./build/onram-cli launch codex
+./build/onram-cli launch pi
+```
+
+From inside `build/`, use `./onram-cli launch claude` (or `codex` / `pi`). Any
+options after the client name are passed to that client. The launcher pairs
+`models/llama3.2-1b-instruct-current.gguf` with
+`models/llama3.2-1b-instruct.nram`; `--model` always names a `.gguf`, while
+`--bundle` names the `.nram` adapter file.
+
 The native launcher is a command dispatcher, not a self-contained model
 runtime. Python dependencies, checkpoint files, and the `llama-server`
 executable remain separate runtime requirements. The upstream v2 LoRA bundles
@@ -364,6 +379,57 @@ path. GGUF export also depends on llama.cpp having a converter for the model's
 architecture. Architectures with custom projections may need explicit target
 names, and custom model code must be opted into with `--trust-remote-code`.
 
+Generic evolution automatically selects CUDA, then Apple MPS, then CPU. CPU
+training uses up to 10 PyTorch threads and batches four examples to reduce
+per-example model calls; override with `--device`, `--threads`, and
+`--batch-size`. The Onram status endpoint exposes the current stage, batch
+count, device, and elapsed seconds while training.
+
+After each run, the `.nram` manifest stores an `inference_attribution` profile.
+It replays captured prompt/answer pairs through the trainable Transformers
+model, records adapter-input/output magnitudes and per-layer LoRA gradient
+strength, and uses the strongest 60% of layers as the next run's update targets
+once a prior profile exists. Validation and the general guardrail still decide
+whether changed adapter weights are accepted. This is gradient-based attribution
+of captured responses; llama.cpp's GGUF runtime does not identify a unique set
+of causal weights for generated text. A rejected candidate saves the diagnostic
+profile and validation report while retaining the previous adapter tensors.
+
+For an instrumented Transformers generation, the `nram-debug` command runs the
+prompt through the bundle and records per-layer hidden-state RMS/top channels
+plus each LoRA adapter's contribution magnitude. It prints the answer but
+stores only prompt/answer hashes in the JSON report. Add
+`--gradient-attribution` to run a slower teacher-forced gradient pass over the
+generated answer and rank adapter targets for investigation:
+
+```sh
+./build/onram-cli nram-debug "Explain this function and its edge cases." \
+  --bundle models/llama3.2-1b-instruct.nram \
+  --local-files-only --gradient-attribution \
+  --output results/inference-debug.json
+```
+
+This is a Transformers replay using the `.nram` bundle, not a trace from the
+live quantized `llama-server` GGUF process. Activation magnitudes and
+gradient-based adapter scores are diagnostic signals, not proof that a specific
+base-model weight caused an answer. The debugger never changes weights; a
+candidate still needs separate validation and promotion gates. The additional
+gradient pass can use substantially more memory.
+
+Normal agent requests through Onram also use the patched GGUF runtime debugger
+by default. Build Onram's local `llama-server` with `./setup_onram.sh`, then
+inspect its state at `GET /api/debug/status`. It writes one compact JSONL entry
+per request under the model's ignored learning directory, with prompt/answer
+hashes and per-layer final-residual RMS/top-channel summaries. Raw text and full
+activation vectors are not written. Disable runtime tracing with
+`--no-inference-debug` or `ONRAM_INFERENCE_DEBUG=0`.
+
+The GGUF trace comes from the actual quantized server request. It exposes
+activation magnitudes, not gradients through quantized weights; use the
+Transformers `nram-debug --gradient-attribution` replay for adapter-gradient
+salience. Neither score alone proves that a weight caused an answer, and neither
+automatically mutates the model.
+
 To keep an arbitrary converted model in Onram's inference loop, first export
 the initial (zero-adapter) checkpoint and link its GGUF to a model-specific
 current pointer, then start Onram with that bundle. Its `/api/evolve` endpoint
@@ -382,3 +448,112 @@ ln -s my-model-bootstrap-Q4_K_M.gguf models/my-model-current.gguf
 The generic server mode still uses the bundled example datasets by default;
 replace them with curated examples and separate held-out validation/guardrail
 sets before relying on training results.
+
+## Learning from local API interactions
+
+The server enables local interaction learning by default, including when
+launched through `./build/onram-cli serve` or `./onram serve`. To disable it for
+one run, pass `--no-auto-learn` or set `ONRAM_AUTO_LEARN=0`. Start the configured
+Llama bundle with:
+
+```sh
+./start-onram-learning.sh
+```
+
+The same launcher enables the per-layer GGUF trace. Recent reports are stored
+in `models/llama3.2-1b-instruct-learning/inference-traces.jsonl`; the temporary
+callback stream is cleared after each request. The server uses one parallel
+slot so each trace remains associated with the request that produced it.
+`./onram-cli runtime-setup` applies the llama.cpp callback patch from
+`patches/llama-cpp-inference-trace.patch` before rebuilding the server. The
+runtime GGUF is downloaded separately because model files are local artifacts:
+
+```sh
+hf download bartowski/Llama-3.2-1B-Instruct-GGUF \
+  Llama-3.2-1B-Instruct-Q4_K_M.gguf \
+  --local-dir models/llama3.2-1b-instruct-runtime-gguf
+ln -s llama3.2-1b-instruct-runtime-gguf/Llama-3.2-1B-Instruct-Q4_K_M.gguf \
+  models/llama3.2-1b-instruct-current.gguf
+```
+
+The trace stores prompt/response hashes and per-layer residual activation
+summaries; it does not persist prompt or response text or full activations.
+
+### Feed answer quality back into selective training
+
+When Onram is running, list recent traces and copy the `trace_id` for the
+answer you want to rate. Then submit `good` to keep that generated pair as a
+positive example, or `bad` with a corrected answer to train on your correction:
+
+```sh
+curl -s http://127.0.0.1:11534/api/debug/traces
+curl -s -X POST http://127.0.0.1:11534/api/learning/feedback \
+  -H 'Content-Type: application/json' \
+  -d '{"trace_id":"<trace-id>","rating":"bad","corrected_completion":"Respuesta corregida por ti."}'
+```
+
+Use `"rating":"good"` to approve a response; `corrected_completion` is only
+accepted with a bad rating. A bad answer without a correction is excluded from
+the training split. The correction replaces that answer as the supervised
+target and is stored in the feedback ledger because it is text explicitly
+provided by you. Feedback is matched to the actual GGUF inference using its
+trace ID and text hashes; the trace ledger itself continues to store hashes,
+not conversation text.
+
+Three distinct bad traces with your corrections are required before their GGUF activation
+profiles can guide initial layer selection. The profile compares per-layer
+residual RMS on corrected bad answers with approved good answers when those are
+available. It is a selection hint, not a causal explanation: LoRA gradients,
+held-out validation, personal validation, and general guardrails still gate
+the candidate. Automatic evolution also requires the configured interaction
+batch plus at least 10 training and 3 validation examples. Check
+`GET /api/learning/status` and `GET /api/evolve/status` to see whether feedback
+has accumulated or an evolution run has started.
+
+Claude Code, Codex, Pi, or another client must send inference requests to this
+Onram instance for those turns to be captured. The listener is local-only at
+`http://127.0.0.1:11534`; the current setup uses `/v1/messages` (Anthropic),
+`/v1/responses` (OpenAI Responses), `/v1/chat/completions`, and `/api/chat` or
+`/api/generate`. The current Codex conversation is not captured unless Codex is
+configured to use this provider.
+
+On this computer, the clients are configured as opt-in profiles:
+
+```sh
+./claude-local.sh
+codex --profile onram
+pi --provider onram --model llama3.2-1b-instruct:latest
+```
+
+For another OpenAI-compatible client, set its base URL to
+`http://127.0.0.1:11534/v1`, its API key to `local-onram`, and its model to
+`llama3.2-1b-instruct:latest`. Start Onram first with `./start-onram-learning.sh`.
+The existing Codex default model and Pi's Ollama provider remain available.
+
+Llama 3.2 1B supports up to 128K tokens. The launchers leave llama.cpp's
+`--ctx-size` at `0`, which loads the GGUF's native maximum (131072 tokens for
+this model); Pi and the Onram Codex profile advertise the same limit. Long
+prompts use more unified memory, so actual usable context can still depend on
+available memory.
+
+Onram stores unique, completed text pairs in the ignored file
+`models/llama3.2-1b-instruct-learning/interactions.jsonl`. It omits system
+prompts and tool payloads, skips tool-call/partial responses, and keeps only
+recent user text plus the final assistant text. It also records explicitly
+stated names and preferences in the ignored `personal_facts.json` file and
+builds dedicated personal question/answer examples for evolution. Every 24 new
+conversation pairs, it trains a candidate and validates both generated fact
+recall and general behavior. A new or changed personal fact gets 50 focused
+epochs; later micro-updates use 8 epochs. Personal examples use the model's
+chat template and include held-out paraphrases. A personal-fact candidate is
+promoted only when held-out generation answers at least 75% of those questions
+with the expected fact, personal loss improves, and general validation and the
+guardrail stay within limits.
+Accepted candidates reload automatically. An interrupted attempt is resumed
+when the server starts again. Check progress and the number of
+captured personal facts at `GET /api/learning/status`; `/api/evolve/status`
+shows the current candidate run. This is still local self-distillation from
+the model's own final answers, not a signal that the user approved each answer.
+Inspect the captured files and periodically review or remove entries that
+should not be retained. Training uses the BF16 Hugging Face base and can put
+memory pressure on a 16 GB machine.

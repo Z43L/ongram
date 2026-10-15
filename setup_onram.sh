@@ -49,6 +49,12 @@ if [[ "$MANAGED_LLAMA_DIR" == 1 ]] && rg -q 'yield from super\(\).modify_tensors
   git -C "$LLAMA_DIR" apply "$PATCH"
 fi
 
+TRACE_PATCH="$SCRIPT_DIR/patches/llama-cpp-inference-trace.patch"
+if ! rg -q 'ONRAM_INFERENCE_TRACE_FILE' "$LLAMA_DIR/tools/server/server-context.cpp"; then
+  git -C "$LLAMA_DIR" apply --check "$TRACE_PATCH"
+  git -C "$LLAMA_DIR" apply "$TRACE_PATCH"
+fi
+
 "$CMAKE_BIN" -S "$LLAMA_DIR" -B "$SCRIPT_DIR/build" \
   -DGGML_CUDA=OFF -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF \
   -DLLAMA_BUILD_EXAMPLES=ON -DLLAMA_BUILD_SERVER=ON

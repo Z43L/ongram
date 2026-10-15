@@ -32,7 +32,15 @@ def main() -> None:
         local_files_only=args.local_files_only,
     )
     model.to(args.device).eval()
-    encoded = tokenizer(args.prompt, return_tensors="pt").to(args.device)
+    if getattr(tokenizer, "chat_template", None):
+        rendered = tokenizer.apply_chat_template(
+            [{"role": "user", "content": args.prompt}],
+            tokenize=False, add_generation_prompt=True,
+        )
+        encoded = tokenizer(rendered, return_tensors="pt", add_special_tokens=False)
+    else:
+        encoded = tokenizer(args.prompt, return_tensors="pt")
+    encoded = encoded.to(args.device)
     with torch.inference_mode():
         output = model.generate(
             **encoded,
@@ -40,7 +48,8 @@ def main() -> None:
             do_sample=False,
             pad_token_id=tokenizer.eos_token_id,
         )
-    print(tokenizer.decode(output[0], skip_special_tokens=True))
+    generated = output[0, encoded["input_ids"].shape[1]:]
+    print(tokenizer.decode(generated, skip_special_tokens=True))
 
 
 if __name__ == "__main__":

@@ -9,21 +9,26 @@ Ollama.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import http.client
 import json
 import os
 import re
 import shutil
 import subprocess
+import sys
 import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from interaction_learning import (InteractionBuffer, extract_completion,
+                                 extract_pair, extract_prompt)
 
 ROOT = Path(__file__).resolve().parent
 MODEL_POINTER = ROOT / "models" / "onram-current.gguf"
@@ -52,7 +57,9 @@ ALLOWED_DATASETS = {
 class Onram:
     def __init__(self, model_path: Path, llama_server: Path, host: str, port: int,
                  backend_port: int, bundle: Path, api_key: str | None = None,
-                 model_name: str | None = None, ctx_size: int = 0):
+                 model_name: str | None = None, ctx_size: int = 0,
+                 auto_learn: bool = False, learn_batch_size: int = 24,
+                 inference_debug: bool = False):
         self._stable_model_alias = model_name or ("distilgpt2-nram:latest" if model_path.name == MODEL_POINTER.name else None)
         self.model_path = model_path.resolve()
         self.llama_server = llama_server.resolve()
@@ -63,6 +70,36 @@ class Onram:
         self.ctx_size = ctx_size
         self.model_pointer = MODEL_POINTER if model_path.name == MODEL_POINTER.name else self.bundle.with_name(self.bundle.stem + "-current.gguf")
         self.api_key = api_key
+        self.auto_learn = auto_learn
+        self.inference_debug = inference_debug
+        self.learn_batch_size = learn_batch_size
+        self.learning_lock = threading.Lock()
+        self.learning = InteractionBuffer(ROOT / "models" / f"{self.bundle.stem}-learning")
+        self.trace_scratch = self.learning.directory / "llama-layer-trace.jsonl"
+        self.trace_ledger = self.learning.directory / "inference-traces.jsonl"
+        self.debug_trace_count = sum(1 for _ in self.trace_ledger.open(encoding="utf-8")) if self.trace_ledger.exists() else 0
+        self.debug_status: dict[str, Any] = {
+            "enabled": inference_debug,
+            "state": "ready" if inference_debug else "disabled",
+            "trace_count": self.debug_trace_count,
+            "trace_file": str(self.trace_ledger),
+            "last_trace_at": None,
+            "last_trace_id": None,
+            "last_error": None,
+        }
+        self.learning_status: dict[str, Any] = {
+            "enabled": auto_learn,
+            "examples": len(self.learning.rows),
+            "personal_facts": self.learning.personal_fact_count,
+            "feedback_count": self.learning.feedback_count,
+            "bad_feedback_count": self.learning.bad_feedback_count,
+            "corrected_bad_feedback_count": self.learning.corrected_bad_feedback_count,
+            "batch_size": learn_batch_size,
+            "last_attempt_count": self.learning.last_attempt_count,
+            "last_attempt_status": self.learning.last_attempt_status,
+            "state": "collecting" if auto_learn else "disabled",
+            "note": "Completed text pairs are stored for training; explicitly stated names and preferences are stored separately. System prompts and tool payloads are omitted.",
+        }
         self.backend: subprocess.Popen[str] | None = None
         self.backend_log = (ROOT / "onram-backend.log").open("a", encoding="utf-8")
         self.lock = threading.RLock()
@@ -90,11 +127,19 @@ class Onram:
                 f"llama-server not found: {self.llama_server}. Build it with `./onram runtime-setup` "
                 "or pass --llama-server /path/to/llama-server."
             )
+        backend_env = os.environ.copy()
+        if self.inference_debug:
+            self.trace_scratch.parent.mkdir(parents=True, exist_ok=True)
+            self.trace_scratch.write_text("", encoding="utf-8")
+            backend_env["ONRAM_INFERENCE_TRACE_FILE"] = str(self.trace_scratch)
+        else:
+            backend_env.pop("ONRAM_INFERENCE_TRACE_FILE", None)
         self.backend = subprocess.Popen(
             [str(self.llama_server), "--model", str(self.model_path), "--host", "127.0.0.1",
              "--port", str(self.backend_port), "--ctx-size", str(self.ctx_size), "--parallel", "1",
              "--alias", self.model_name, "--jinja"],
             cwd=ROOT,
+            env=backend_env,
             stdout=self.backend_log,
             stderr=subprocess.STDOUT,
             text=True,
@@ -142,7 +187,16 @@ class Onram:
         params = self._completion_options(prompt, options)
         params["stream"] = False
         with self.lock:
-            return self._backend_request("POST", "/completion", params)
+            self.begin_runtime_trace()
+            try:
+                result = self._backend_request("POST", "/completion", params)
+                if self.inference_debug:
+                    completion = result.get("content", result.get("completion", ""))
+                    self.finish_runtime_trace_text(prompt, completion)
+                return result
+            except BaseException:
+                self.clear_runtime_trace()
+                raise
 
     @staticmethod
     def _completion_options(prompt: str, options: dict[str, Any]) -> dict[str, Any]:
@@ -172,6 +226,9 @@ class Onram:
         request = urllib.request.Request(self.backend_url + "/completion", data=raw, method="POST",
                                          headers={"Content-Type": "application/json"})
         with self.lock:
+            self.begin_runtime_trace()
+            trace_parts: list[str] = []
+            trace_complete = False
             try:
                 response = urllib.request.urlopen(request, timeout=3600)
                 for raw_line in response:
@@ -182,10 +239,22 @@ class Onram:
                     if payload == "[DONE]":
                         break
                     item = json.loads(payload)
+                    piece = item.get("content", item.get("completion", ""))
+                    if self.inference_debug and isinstance(piece, str):
+                        trace_parts.append(piece)
+                    trace_complete = trace_complete or bool(item.get("stop", False))
                     yield item
+                if self.inference_debug and trace_complete:
+                    self.finish_runtime_trace_text(prompt, "".join(trace_parts))
+                else:
+                    self.clear_runtime_trace()
             except urllib.error.HTTPError as exc:
+                self.clear_runtime_trace()
                 detail = exc.read().decode("utf-8", "replace")
                 raise RuntimeError(f"llama-server returned HTTP {exc.code}: {detail}") from exc
+            except BaseException:
+                self.clear_runtime_trace()
+                raise
 
     def begin_evolution(self, body: dict[str, Any]) -> dict[str, Any]:
         if not self.evolution_lock.acquire(blocking=False):
@@ -209,6 +278,268 @@ class Onram:
             self.evolution_lock.release()
             raise
 
+    def record_interaction(self, path: str, request_body: bytes | None,
+                           response_body: bytes, status: int = 200) -> None:
+        if not self.auto_learn:
+            return
+        prompt = extract_prompt(path, request_body) if 200 <= status < 300 else ""
+        pair = extract_pair(path, request_body, response_body, status)
+        if pair is None and not prompt:
+            return
+        with self.learning_lock:
+            facts_added = self.learning.capture_facts(prompt) if prompt else False
+            if pair is not None:
+                count, pair_added = self.learning.add(*pair)
+            else:
+                count, pair_added = len(self.learning.rows), False
+            self.learning_status.update({"examples": count,
+                                         "personal_facts": self.learning.personal_fact_count,
+                                         "last_captured_at": datetime.now(timezone.utc).isoformat()})
+        if facts_added or pair_added:
+            self._schedule_auto_evolution()
+
+    def record_feedback(self, body: dict[str, Any]) -> dict[str, Any]:
+        trace_id = body.get("trace_id")
+        rating = body.get("rating")
+        corrected = body.get("corrected_completion")
+        if not isinstance(trace_id, str) or not trace_id:
+            raise ValueError("trace_id is required; get it from /api/debug/traces")
+        if rating not in {"good", "bad"}:
+            raise ValueError("rating must be 'good' or 'bad'")
+        if corrected is not None and not isinstance(corrected, str):
+            raise ValueError("corrected_completion must be a string")
+        trace = None
+        try:
+            with self.trace_ledger.open(encoding="utf-8") as stream:
+                for line in stream:
+                    try:
+                        candidate = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(candidate, dict) and candidate.get("trace_id") == trace_id:
+                        trace = candidate
+        except OSError as exc:
+            raise ValueError(f"inference trace ledger is unavailable: {exc}") from exc
+        if trace is None:
+            raise ValueError("trace_id not found; list recent traces at /api/debug/traces")
+        prompt_hash = trace.get("prompt_sha256")
+        completion_hash = trace.get("completion_sha256")
+        if not prompt_hash or not completion_hash or not trace.get("callback_events"):
+            raise ValueError("trace has no complete text pair or GGUF activation events")
+        with self.learning_lock:
+            pair = next((row for row in self.learning.rows
+                         if hashlib.sha256(row["prompt"].encode("utf-8")).hexdigest() == prompt_hash
+                         and hashlib.sha256(row["completion"].encode("utf-8")).hexdigest() == completion_hash), None)
+            if pair is None:
+                raise ValueError("matching interaction is not in the learning ledger; enable auto-learn and retry after the response finishes")
+            feedback = self.learning.record_feedback(
+                pair["prompt"], pair["completion"], trace_id, rating, corrected,
+            )
+            self.learning_status.update({
+                "feedback_count": self.learning.feedback_count,
+                "bad_feedback_count": self.learning.bad_feedback_count,
+                "corrected_bad_feedback_count": self.learning.corrected_bad_feedback_count,
+                "last_feedback_at": feedback["updated_at"],
+            })
+        if rating == "bad":
+            self._schedule_auto_evolution()
+        return {
+            "accepted": True,
+            "rating": rating,
+            "has_correction": bool(feedback.get("corrected_completion")),
+            "feedback_count": self.learning.feedback_count,
+            "bad_feedback_count": self.learning.bad_feedback_count,
+            "corrected_bad_feedback_count": self.learning.corrected_bad_feedback_count,
+            "auto_learn": self.auto_learn,
+        }
+
+    def begin_runtime_trace(self) -> None:
+        if not self.inference_debug:
+            return
+        try:
+            self.trace_scratch.parent.mkdir(parents=True, exist_ok=True)
+            self.trace_scratch.write_text("", encoding="utf-8")
+            self.debug_status.update({"state": "capturing", "last_error": None})
+        except OSError as exc:
+            self.debug_status.update({"state": "failed", "last_error": str(exc)})
+
+    def clear_runtime_trace(self) -> None:
+        if not self.inference_debug:
+            return
+        try:
+            self.trace_scratch.write_text("", encoding="utf-8")
+        except OSError:
+            pass
+
+    def finish_runtime_trace_text(self, prompt: str, completion: str) -> None:
+        if not self.inference_debug:
+            return
+        self.finish_runtime_trace(
+            "/api/generate", json.dumps({"prompt": prompt}).encode("utf-8"),
+            json.dumps({"response": completion, "done": True}).encode("utf-8"), 200,
+        )
+
+    def finish_runtime_trace(self, path: str, request_body: bytes | None,
+                             response_body: bytes | None, status: int = 200) -> None:
+        if not self.inference_debug:
+            return
+        prompt = extract_prompt(path, request_body)
+        completion = extract_completion(path, response_body, status)
+        events = []
+        try:
+            for line in self.trace_scratch.read_text(encoding="utf-8").splitlines():
+                try:
+                    item = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(item, dict) and isinstance(item.get("layer"), int):
+                    events.append(item)
+        except OSError as exc:
+            self.debug_status.update({"state": "failed", "last_error": str(exc)})
+            return
+
+        by_layer: dict[int, dict[str, Any]] = {}
+        for item in events:
+            layer = item["layer"]
+            positions = max(1, int(item.get("positions", 1)))
+            hidden = max(1, int(item.get("hidden_size", 1)))
+            row = by_layer.setdefault(layer, {
+                "layer": layer, "graph_calls": 0, "positions": 0,
+                "hidden_size": hidden, "sum_sq": 0.0,
+                "channel_abs_sum": {}, "channel_counts": {},
+            })
+            row["graph_calls"] += 1
+            row["positions"] += positions
+            row["sum_sq"] += float(item.get("output_rms", 0.0)) ** 2 * positions * hidden
+            for channel in item.get("top_channels", []):
+                if not isinstance(channel, dict) or not isinstance(channel.get("channel"), int):
+                    continue
+                index = channel["channel"]
+                row["channel_abs_sum"][index] = row["channel_abs_sum"].get(index, 0.0) + float(channel.get("mean_abs", 0.0)) * positions
+                row["channel_counts"][index] = row["channel_counts"].get(index, 0) + positions
+
+        layers = []
+        for layer, row in sorted(by_layer.items()):
+            channels = [
+                {"channel": channel, "mean_abs": total / row["channel_counts"][channel]}
+                for channel, total in row["channel_abs_sum"].items()
+            ]
+            channels.sort(key=lambda channel: channel["mean_abs"], reverse=True)
+            layers.append({
+                "layer": layer,
+                "graph_calls": row["graph_calls"],
+                "positions": row["positions"],
+                "hidden_size": row["hidden_size"],
+                "output_rms": (row["sum_sq"] / max(row["positions"] * row["hidden_size"], 1)) ** 0.5,
+                "top_mean_abs_channels": channels[:12],
+            })
+
+        report = {
+            "format": "ONRAM_LLAMA_CPP_INFERENCE_TRACE_V1",
+            "trace_id": str(uuid.uuid4()),
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "backend": "llama.cpp-gguf",
+            "model_file": self.model_path.name,
+            "api_route": urllib.parse.urlsplit(path).path,
+            "http_status": status,
+            "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest() if prompt else None,
+            "completion_sha256": hashlib.sha256(completion.encode("utf-8")).hexdigest() if completion else None,
+            "pair_sha256": hashlib.sha256((prompt + "\0" + completion).encode("utf-8")).hexdigest()
+            if prompt and completion else None,
+            "prompt_text_saved": False,
+            "completion_text_saved": False,
+            "callback_events": len(events),
+            "layer_count": len(layers),
+            "layers": layers,
+            "limitations": [
+                "Captures final residual-stream summaries from quantized GGUF inference; it does not expose a unique causal weight explanation.",
+                "The ggml evaluation callback is experimental and may add latency while copying selected layer outputs to host memory.",
+                "Per-layer channel rankings are descriptive activation magnitudes, not neuron semantics or gradient attribution.",
+            ],
+        }
+        try:
+            self.trace_ledger.parent.mkdir(parents=True, exist_ok=True)
+            encoded = json.dumps(report, ensure_ascii=False, separators=(",", ":")) + "\n"
+            with self.trace_ledger.open("a", encoding="utf-8") as stream:
+                stream.write(encoded)
+            if self.trace_ledger.stat().st_size > 32 * 1024 * 1024:
+                records = self.trace_ledger.read_text(encoding="utf-8").splitlines()
+                self.trace_ledger.write_text("\n".join(records[-500:]) + "\n", encoding="utf-8")
+            self.debug_trace_count += 1
+            self.debug_status.update({
+                "state": "ready" if events else "unsupported_backend",
+                "trace_count": self.debug_trace_count,
+                "last_trace_id": report["trace_id"],
+                "last_trace_at": report["created_at"],
+                "last_error": None if events else "llama-server emitted no l_out activation events; rebuild it with Onram's patched llama.cpp.",
+            })
+        except OSError as exc:
+            self.debug_status.update({"state": "failed", "last_error": str(exc)})
+        finally:
+            try:
+                self.trace_scratch.write_text("", encoding="utf-8")
+            except OSError:
+                pass
+
+    def _schedule_auto_evolution(self, *, retry_pending: bool = False) -> None:
+        if not self.auto_learn:
+            return
+        with self.learning_lock:
+            count = len(self.learning.rows)
+            pending_status = self.learning.last_attempt_status
+            interrupted = (retry_pending and count >= self.learn_batch_size
+                           and self.learning.last_attempt_count > 0
+                           and pending_status != "completed")
+            last_corrected_bad = int(self.learning.state.get(
+                "last_attempt_corrected_bad_feedback_count", 0))
+            feedback_due = self.learning.corrected_bad_feedback_count - last_corrected_bad >= 3
+            due = (count >= self.learn_batch_size and
+                   (count - self.learning.last_attempt_count >= self.learn_batch_size
+                    or interrupted or feedback_due))
+            if not due:
+                return
+            directory = self.learning.directory
+            train = directory / "train.jsonl"
+            validation = directory / "validation.jsonl"
+            train_count, validation_count = self.learning.write_split(train, validation)
+            personal_train = directory / "personal_train.jsonl"
+            personal_validation = directory / "personal_validation.jsonl"
+            new_personal_facts = (self.learning.personal_fact_count > 0
+                                  and self.learning.personal_facts_changed_since_training)
+            personal_train_count, personal_validation_count = self.learning.write_personal_split(
+                personal_train, personal_validation)
+            if train_count < 10 or validation_count < 3:
+                self.learning_status.update({"state": "collecting", "train_examples": train_count,
+                                             "validation_examples": validation_count})
+                return
+            if personal_train_count:
+                if new_personal_facts:
+                    # A new fact gets a focused micro-run. Replaying the model's
+                    # old answers here can dilute or contradict the explicit fact.
+                    train.write_text(personal_train.read_text(encoding="utf-8"),
+                                     encoding="utf-8")
+                else:
+                    with train.open("a", encoding="utf-8") as stream:
+                        stream.write(personal_train.read_text(encoding="utf-8"))
+            if not self.evolution_lock.acquire(blocking=False):
+                self.learning_status["state"] = "waiting_for_evolution"
+                return
+            self.learning.mark_attempt(count, self.learning.corrected_bad_feedback_count)
+            self.learning_status.update({"state": "training", "examples": count,
+                                         "train_examples": train_count + personal_train_count,
+                                         "validation_examples": validation_count + personal_validation_count,
+                                         "last_attempt_count": count,
+                                         "last_attempt_status": "running"})
+            self.evolution = {"state": "running", "started_at": datetime.now(timezone.utc).isoformat(),
+                              "stage": "training", "accepted": None,
+                              "source": "interactions", "personal_facts": self.learning.personal_fact_count}
+            automatic_epochs = 50 if new_personal_facts else 8
+        guardrail = ROOT / "data" / "general_guardrail.jsonl"
+        threading.Thread(target=self._evolve_worker,
+                         args=(train, validation, guardrail, automatic_epochs, 0.00001, 256, True,
+                               personal_validation if personal_validation_count else None),
+                         daemon=True).start()
+
     @staticmethod
     def _dataset(name: str) -> Path:
         if name not in ALLOWED_DATASETS:
@@ -219,9 +550,14 @@ class Onram:
         return path
 
     def _evolve_worker(self, train: Path, validation: Path, guardrail: Path,
-                       epochs: int, learning_rate: float) -> None:
+                       epochs: int, learning_rate: float, max_length: int = 512,
+                       automatic: bool = False,
+                       personal_validation: Path | None = None) -> None:
         try:
-            python = str(ROOT / ".venv" / "bin" / "python")
+            # Use the interpreter that is already running Onram unless the user
+            # explicitly selects another environment. This keeps launcher-based
+            # learning working even when this checkout has no local .venv.
+            python = os.environ.get("ONRAM_PYTHON") or sys.executable
             from nram_container import load_bundle
             manifest, _ = load_bundle(self.bundle)
             generic = manifest.get("model_family") == "hf-causal-lm-dense-lora"
@@ -230,14 +566,46 @@ class Onram:
                            "--bundle", str(self.bundle), "--train", str(train),
                            "--validation", str(validation), "--guardrail", str(guardrail),
                            "--epochs", str(epochs), "--learning-rate", str(learning_rate),
-                           "--local-files-only"]
+                           "--max-length", str(max_length), "--batch-size", "2",
+                           "--min-behavior-accuracy", "0.75", "--local-files-only"]
+                if self.trace_ledger.is_file():
+                    command.extend(("--runtime-traces", str(self.trace_ledger)))
+                if personal_validation:
+                    command.extend(("--personal-validation", str(personal_validation)))
             else:
                 command = [python, str(ROOT / "nram_evolve.py"),
                            "--train", str(train), "--validation", str(validation),
                            "--guardrail", str(guardrail), "--output", str(self.bundle),
                            "--epochs", str(epochs), "--learning-rate", str(learning_rate)]
-            proc = subprocess.run(command, cwd=ROOT, text=True, capture_output=True, timeout=6 * 60 * 60)
-            output = proc.stdout + "\n" + proc.stderr
+            proc = subprocess.Popen(command, cwd=ROOT, text=True, stdout=subprocess.PIPE,
+                                    stderr=subprocess.STDOUT, bufsize=1)
+            output_lines: list[str] = []
+
+            def collect_output() -> None:
+                if proc.stdout is None:
+                    return
+                for line in proc.stdout:
+                    output_lines.append(line)
+                    if line.startswith("@onram-progress "):
+                        try:
+                            progress = json.loads(line[len("@onram-progress "):])
+                        except json.JSONDecodeError:
+                            continue
+                        current = dict(self.evolution)
+                        current.update(progress)
+                        current["state"] = "running"
+                        self.evolution = current
+
+            reader = threading.Thread(target=collect_output, daemon=True)
+            reader.start()
+            try:
+                proc.wait(timeout=6 * 60 * 60)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+                raise TimeoutError("evolution exceeded the six-hour runtime limit")
+            reader.join(timeout=5)
+            output = "".join(output_lines)
             if proc.returncode:
                 raise RuntimeError(output[-6000:] or f"evolver exited {proc.returncode}")
             match = re.search(r'"accepted"\s*:\s*(true|false)', output)
@@ -271,11 +639,28 @@ class Onram:
                 report["export_log"] = export_text[-2000:]
                 report["stage"] = "ready"
             self.evolution = report
+            if automatic:
+                self.learning_status.update({"state": "completed", "accepted": accepted,
+                                             "finished_at": report["finished_at"],
+                                             "last_attempt_status": "completed",
+                                             "evolution": report})
+                with self.learning_lock:
+                    self.learning.finish_attempt("completed", accepted=accepted,
+                                                 finished_at=report["finished_at"])
         except BaseException as exc:
             self.evolution = {"state": "failed", "stage": "error", "error": str(exc),
                               "finished_at": datetime.now(timezone.utc).isoformat()}
+            if automatic:
+                self.learning_status.update({"state": "failed", "error": str(exc),
+                                             "finished_at": self.evolution["finished_at"],
+                                             "last_attempt_status": "failed"})
+                with self.learning_lock:
+                    self.learning.finish_attempt("failed", error=str(exc),
+                                                 finished_at=self.evolution["finished_at"])
         finally:
             self.evolution_lock.release()
+            if automatic:
+                self._schedule_auto_evolution()
 
     def _bundle_version(self) -> int:
         from nram_container import load_bundle
@@ -303,7 +688,9 @@ class Onram:
         return {"name": "onram", "version": "0.1.0", "model": self.model_name,
                 "model_path": str(self.model_path), "backend": "llama.cpp",
                 "backend_running": self.backend is not None and self.backend.poll() is None,
-                "evolution": dict(self.evolution), "started_at": self.started_at}
+                "evolution": dict(self.evolution), "learning": dict(self.learning_status),
+                "inference_debug": dict(self.debug_status),
+                "started_at": self.started_at}
 
 
 def handler_for(app: Onram):
@@ -378,16 +765,27 @@ def handler_for(app: Onram):
             request = urllib.request.Request(
                 app.backend_url + self.path, data=body, headers=headers, method=method
             )
+            captured = bytearray()
+            inference_debug = getattr(app, "inference_debug", False)
+            auto_learn = getattr(app, "auto_learn", False)
+            capture_ok = (auto_learn or inference_debug) and body is not None
+            capture_complete = False
+            upstream_status = 502
             with app.lock:
+                if inference_debug:
+                    app.begin_runtime_trace()
                 try:
                     upstream = urllib.request.urlopen(request, timeout=24 * 60 * 60)
                 except urllib.error.HTTPError as exc:
                     upstream = exc
                 except (urllib.error.URLError, TimeoutError, OSError) as exc:
+                    if inference_debug:
+                        app.clear_runtime_trace()
                     self._json({"error": f"llama-server unavailable: {exc}"}, 502)
                     return
 
                 with upstream:
+                    upstream_status = upstream.status
                     self.send_response(upstream.status)
                     has_content_length = False
                     for key, value in upstream.headers.items():
@@ -411,12 +809,23 @@ def handler_for(app: Onram):
                             chunk = read_chunk(16_384)
                             if not chunk:
                                 break
+                            if capture_ok:
+                                if len(captured) + len(chunk) <= 4_000_000:
+                                    captured.extend(chunk)
+                                else:
+                                    capture_ok = False
                             self.wfile.write(chunk)
                             self.wfile.flush()
+                        capture_complete = True
                     except (BrokenPipeError, ConnectionResetError, http.client.HTTPException, OSError):
                         # A client cancelling a generation should stop consuming
                         # the local response without crashing the HTTP worker.
                         self.close_connection = True
+                if inference_debug:
+                    response_body = bytes(captured) if capture_complete and capture_ok else None
+                    app.finish_runtime_trace(self.path, body, response_body, upstream_status)
+            if auto_learn and capture_ok and capture_complete:
+                app.record_interaction(self.path, body, bytes(captured), upstream_status)
 
         def _authorized(self) -> bool:
             if not app.api_key:
@@ -436,6 +845,21 @@ def handler_for(app: Onram):
                     return self._json(app.status())
                 if self.path == "/api/evolve/status":
                     return self._json(app.status()["evolution"])
+                if self.path == "/api/learning/status":
+                    return self._json(dict(app.learning_status))
+                if self.path == "/api/debug/status":
+                    return self._json(dict(app.debug_status))
+                if self.path == "/api/debug/traces":
+                    traces = []
+                    if app.trace_ledger.is_file():
+                        for line in app.trace_ledger.read_text(encoding="utf-8").splitlines():
+                            try:
+                                item = json.loads(line)
+                            except json.JSONDecodeError:
+                                continue
+                            if isinstance(item, dict):
+                                traces.append(item)
+                    return self._json({"traces": traces[-20:]})
                 if self.path == "/v1/models":
                     return self._json({"object": "list", "data": [{
                         "id": app.model_name,
@@ -490,9 +914,13 @@ def handler_for(app: Onram):
                         self.send_header("Cache-Control", "no-cache")
                         self.send_header("Transfer-Encoding", "chunked")
                         self.end_headers()
+                        captured_text = []
+                        completed = False
                         try:
                             for item in app.stream_generate(prompt, body.get("options") or {}):
                                 piece = item.get("content", item.get("completion", ""))
+                                if isinstance(piece, str):
+                                    captured_text.append(piece)
                                 done = bool(item.get("stop", False))
                                 if self.path == "/api/chat":
                                     chunk = {"model": app.model_name,
@@ -508,7 +936,15 @@ def handler_for(app: Onram):
                                 data = (json.dumps(chunk, ensure_ascii=False) + "\n").encode("utf-8")
                                 self.wfile.write(f"{len(data):X}\r\n".encode() + data + b"\r\n")
                                 self.wfile.flush()
+                                completed = completed or done
                             self.wfile.write(b"0\r\n\r\n")
+                            if completed:
+                                if self.path == "/api/chat":
+                                    learned_response = {"message": {"content": "".join(captured_text)}, "done": True}
+                                else:
+                                    learned_response = {"response": "".join(captured_text), "done": True}
+                                app.record_interaction(self.path, json.dumps(body).encode(),
+                                                       json.dumps(learned_response).encode())
                         except Exception as exc:
                             print(f"[onram] streaming error: {exc}", flush=True)
                         return
@@ -524,9 +960,12 @@ def handler_for(app: Onram):
                                     "response": text, "done": True,
                                     "total_duration": int((time.monotonic() - started) * 1e9),
                                     "eval_count": result.get("tokens_predicted", 0)}
+                    app.record_interaction(self.path, json.dumps(body).encode(), json.dumps(response).encode())
                     return self._json(response)
                 if self.path == "/api/evolve":
                     return self._json(app.begin_evolution(body), 202)
+                if self.path == "/api/learning/feedback":
+                    return self._json(app.record_feedback(body), 202)
                 if self.path == "/api/show":
                     return self._json({"modelfile": f"FROM {app.model_path}", "parameters": "",
                         "template": "{{ .Prompt }}", "details": {"format": "gguf", "family": "gpt2",
@@ -559,19 +998,39 @@ def main() -> None:
                         help="llama.cpp context size; 0 uses the GGUF's model default")
     parser.add_argument("--api-key", default=os.environ.get("ONRAM_API_KEY"))
     parser.add_argument("--model-name", help="Stable model name exposed by /api/tags")
+    auto_learn_default = os.environ.get("ONRAM_AUTO_LEARN", "1").strip().lower() not in {
+        "0", "false", "no", "off",
+    }
+    parser.add_argument("--auto-learn", action=argparse.BooleanOptionalAction,
+                        default=auto_learn_default,
+                        help="Capture completed text turns and train a validated candidate every batch (enabled by default; use --no-auto-learn to disable)")
+    inference_debug_default = os.environ.get("ONRAM_INFERENCE_DEBUG", "1").strip().lower() not in {
+        "0", "false", "no", "off",
+    }
+    parser.add_argument("--inference-debug", action=argparse.BooleanOptionalAction,
+                        default=inference_debug_default,
+                        help="Capture per-layer GGUF inference activation summaries (enabled by default; use --no-inference-debug to disable)")
+    parser.add_argument("--learn-batch-size", type=int,
+                        default=int(os.environ.get("ONRAM_LEARN_BATCH_SIZE", "24")),
+                        help="New unique turns required before an automatic training attempt")
     args = parser.parse_args()
     if args.host not in ("127.0.0.1", "localhost", "::1") and not args.api_key:
         parser.error("binding to a non-local address requires --api-key or ONRAM_API_KEY")
     if args.ctx_size < 0:
         parser.error("--ctx-size must be 0 or greater")
+    if args.learn_batch_size < 16:
+        parser.error("--learn-batch-size must be at least 16 to preserve a validation split")
     model_name = args.model_name
     if model_name and ":" not in model_name:
         model_name += ":latest"
     app = Onram(args.model, args.llama_server, args.host, args.port, args.backend_port,
-                args.bundle, args.api_key, model_name, args.ctx_size)
+                args.bundle, args.api_key, model_name, args.ctx_size,
+                args.auto_learn, args.learn_batch_size, args.inference_debug)
     app.start_backend()
     server = ThreadingHTTPServer((args.host, args.port), handler_for(app))
     print(f"onram listening at http://{args.host}:{args.port} with {app.model_path.name}", flush=True)
+    if args.auto_learn:
+        app._schedule_auto_evolution(retry_pending=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
