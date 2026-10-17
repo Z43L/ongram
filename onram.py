@@ -27,6 +27,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from episodic_memory import DEFAULT_MEMORY, EpisodicMemory
 from interaction_learning import (InteractionBuffer, extract_completion,
                                  extract_pair, extract_prompt)
 
@@ -47,6 +48,7 @@ def _default_llama_server() -> Path:
 
 
 DEFAULT_LLAMA_SERVER = _default_llama_server()
+DEFAULT_STRATA_DIR = ROOT / "third_party" / "strata"
 ALLOWED_DATASETS = {
     "nra_qa_train.jsonl",
     "nra_qa_validation.jsonl",
@@ -59,7 +61,26 @@ class Onram:
                  backend_port: int, bundle: Path, api_key: str | None = None,
                  model_name: str | None = None, ctx_size: int = 0,
                  auto_learn: bool = False, learn_batch_size: int = 24,
-                 inference_debug: bool = False):
+                 inference_debug: bool = False, backend_kind: str = "llama.cpp",
+                 strata_dir: Path | None = None, strata_config: Path | None = None,
+                 strata_python: Path | None = None, llama_args: list[str] | None = None,
+                 chl_memory: Path = DEFAULT_MEMORY):
+        if backend_kind not in {"llama.cpp", "strata", "nram"}:
+            raise ValueError("Unknown backend")
+        self.episodic = EpisodicMemory(chl_memory)
+        self.episodic.call("recall", query="", top_k=1)
+        self.memory_error = None
+        self.llama_args = list(llama_args or [])
+        self.backend_kind = backend_kind
+        self.strata_dir = (strata_dir or DEFAULT_STRATA_DIR).resolve()
+        self.strata_config = strata_config.resolve() if strata_config else None
+        self.strata_python = (strata_python or self.strata_dir / ".venv/bin/python").absolute()
+        if backend_kind == "nram":
+            auto_learn = inference_debug = False
+            model_name = model_name or "athenea-e2b:latest"
+        if backend_kind == "strata":
+            auto_learn = inference_debug = False
+            model_name = model_name or "qwen3.8-flash-next:latest"
         self._stable_model_alias = model_name or ("distilgpt2-nram:latest" if model_path.name == MODEL_POINTER.name else None)
         self.model_path = model_path.resolve()
         self.llama_server = llama_server.resolve()
@@ -120,6 +141,11 @@ class Onram:
         return f"{name}:latest"
 
     def start_backend(self) -> None:
+        if self.backend_kind == "nram":
+            return self._start_nram()
+        if self.backend_kind == "strata":
+            self._start_strata()
+            return
         if not self.model_path.is_file():
             raise FileNotFoundError(f"GGUF not found: {self.model_path}")
         if not self.llama_server.is_file():
@@ -137,14 +163,14 @@ class Onram:
         self.backend = subprocess.Popen(
             [str(self.llama_server), "--model", str(self.model_path), "--host", "127.0.0.1",
              "--port", str(self.backend_port), "--ctx-size", str(self.ctx_size), "--parallel", "1",
-             "--alias", self.model_name, "--jinja"],
+             "--alias", self.model_name, "--jinja", *self.llama_args],
             cwd=ROOT,
             env=backend_env,
             stdout=self.backend_log,
             stderr=subprocess.STDOUT,
             text=True,
         )
-        deadline = time.monotonic() + 90
+        deadline = time.monotonic() + (900 if self.ctx_size >= 65536 else 90)
         while time.monotonic() < deadline:
             if self.backend.poll() is not None:
                 raise RuntimeError(f"llama-server exited with code {self.backend.returncode}; see onram-backend.log")
@@ -155,6 +181,83 @@ class Onram:
                 time.sleep(0.25)
         self.stop_backend()
         raise TimeoutError("Timed out waiting for llama-server health")
+
+    def _start_nram(self) -> None:
+        if not self.bundle.is_file():
+            raise FileNotFoundError(f"NRAM bundle missing: {self.bundle}")
+        self.backend = subprocess.Popen(
+            [sys.executable, str(ROOT / "native_runtime.py"), "--bundle", str(self.bundle),
+             "--port", str(self.backend_port), "--model-name", self.model_name,
+             "--ctx-size", str(self.ctx_size)], cwd=ROOT,
+            stdout=self.backend_log, stderr=subprocess.STDOUT, text=True)
+        deadline = time.monotonic() + 600
+        try:
+            while time.monotonic() < deadline:
+                if self.backend.poll() is not None:
+                    raise RuntimeError("Direct NRAM runtime exited; see onram-backend.log")
+                try:
+                    if self._backend_request("GET", "/health", None, timeout=1).get("loaded"):
+                        return
+                except (OSError, urllib.error.URLError, RuntimeError):
+                    time.sleep(.25)
+            raise TimeoutError("Timed out loading direct NRAM runtime")
+        except BaseException:
+            self.stop_backend()
+            raise
+
+    def _start_strata(self) -> None:
+        if not self.strata_config or not self.strata_config.is_file():
+            raise FileNotFoundError("Strata requires --strata-config pointing to the JSON produced by its setup")
+        if not (self.strata_dir / "serve/server.py").is_file():
+            raise FileNotFoundError(f"Strata server missing in {self.strata_dir}")
+        if not self.strata_python.is_file():
+            raise FileNotFoundError(f"Strata Python missing: {self.strata_python}")
+        self.backend = subprocess.Popen(
+            [str(self.strata_python), "-m", "serve.server", "--engine", "strata",
+             "--config", str(self.strata_config), "--host", "127.0.0.1",
+             "--port", str(self.backend_port)],
+            cwd=self.strata_dir, stdout=self.backend_log, stderr=subprocess.STDOUT,
+            text=True,
+        )
+        deadline = time.monotonic() + 1800
+        try:
+            while time.monotonic() < deadline:
+                if self.backend.poll() is not None:
+                    raise RuntimeError("Strata exited; see onram-backend.log")
+                try:
+                    health = self._backend_request("GET", "/health", None, timeout=1)
+                    if health.get("loaded", False):
+                        return
+                except (OSError, urllib.error.URLError, RuntimeError):
+                    time.sleep(0.25)
+            raise TimeoutError("Timed out waiting for Strata health")
+        except BaseException:
+            self.stop_backend()
+            raise
+
+    def _completion_request(self, params: dict[str, Any]):
+        if getattr(self, "backend_kind", "llama.cpp") not in {"strata", "nram"}:
+            return "/completion", params
+        body = {"model": self.model_name,
+                "messages": params.get("messages") or [{"role": "user", "content": params["prompt"]}],
+                "max_tokens": params["n_predict"], "stream": params["stream"],
+                "reasoning_effort": "none",
+                "temperature": params["temperature"], "top_p": params["top_p"],
+                "top_k": params["top_k"], "repeat_penalty": params["repeat_penalty"]}
+        if "stop" in params:
+            body["stop"] = params["stop"]
+        return "/v1/chat/completions", body
+
+    @staticmethod
+    def _strata_completion(item: dict[str, Any], streaming: bool = False):
+        if "error" in item:
+            raise RuntimeError(f"Strata inference failed: {item['error']}")
+        choices = item.get("choices") or []
+        choice = choices[0] if choices else {}
+        message = choice.get("delta" if streaming else "message") or {}
+        return {"content": message.get("content") or "",
+                "stop": choice.get("finish_reason") is not None if streaming else True,
+                "tokens_predicted": (item.get("usage") or {}).get("completion_tokens", 0)}
 
     def stop_backend(self) -> None:
         process = self.backend
@@ -173,18 +276,23 @@ class Onram:
 
     def _backend_request(self, method: str, path: str, body: dict[str, Any] | None,
                          timeout: float = 120) -> dict[str, Any]:
+        translate = path == "/completion" and getattr(self, "backend_kind", "llama.cpp") in {"strata", "nram"}
+        if translate:
+            path, body = self._completion_request(body)
         raw = json.dumps(body).encode() if body is not None else None
         request = urllib.request.Request(self.backend_url + path, data=raw, method=method,
                                          headers={"Content-Type": "application/json"})
         try:
             with urllib.request.urlopen(request, timeout=timeout) as response:
-                return json.loads(response.read()) if response.status != 204 else {}
+                result = json.loads(response.read()) if response.status != 204 else {}
+                return self._strata_completion(result) if translate else result
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", "replace")
             raise RuntimeError(f"llama-server returned HTTP {exc.code}: {detail}") from exc
 
     def generate(self, prompt: str, options: dict[str, Any]) -> dict[str, Any]:
-        params = self._completion_options(prompt, options)
+        params = self._completion_options(prompt, options,
+            (self.ctx_size or 131072) if self.backend_kind == "nram" else 512)
         params["stream"] = False
         with self.lock:
             self.begin_runtime_trace()
@@ -199,11 +307,11 @@ class Onram:
                 raise
 
     @staticmethod
-    def _completion_options(prompt: str, options: dict[str, Any]) -> dict[str, Any]:
-        num_predict = int(options.get("num_predict", 128))
+    def _completion_options(prompt: str, options: dict[str, Any], max_tokens: int = 512) -> dict[str, Any]:
+        num_predict = int(options.get("num_predict", max_tokens if max_tokens != 512 else 128))
         temperature = float(options.get("temperature", 0.8))
-        if not 1 <= num_predict <= 512:
-            raise ValueError("num_predict must be between 1 and 512 for this prototype")
+        if not 1 <= num_predict <= max_tokens:
+            raise ValueError(f"num_predict must be between 1 and {max_tokens}")
         if not 0 <= temperature <= 2:
             raise ValueError("temperature must be between 0 and 2")
         params: dict[str, Any] = {
@@ -215,15 +323,19 @@ class Onram:
             "repeat_penalty": float(options.get("repeat_penalty", 1.1)),
             "stream": False,
         }
+        if options.get("_messages") is not None:
+            params["messages"] = options["_messages"]
         if options.get("stop"):
             params["stop"] = options["stop"]
         return params
 
     def stream_generate(self, prompt: str, options: dict[str, Any]):
-        params = self._completion_options(prompt, options)
+        params = self._completion_options(prompt, options,
+            (self.ctx_size or 131072) if self.backend_kind == "nram" else 512)
         params["stream"] = True
+        path, params = self._completion_request(params)
         raw = json.dumps(params).encode()
-        request = urllib.request.Request(self.backend_url + "/completion", data=raw, method="POST",
+        request = urllib.request.Request(self.backend_url + path, data=raw, method="POST",
                                          headers={"Content-Type": "application/json"})
         with self.lock:
             self.begin_runtime_trace()
@@ -237,8 +349,12 @@ class Onram:
                         continue
                     payload = line[5:].strip()
                     if payload == "[DONE]":
+                        if getattr(self, "backend_kind", "llama.cpp") in {"strata", "nram"} and not trace_complete:
+                            yield {"content": "", "stop": True}
                         break
                     item = json.loads(payload)
+                    if getattr(self, "backend_kind", "llama.cpp") in {"strata", "nram"}:
+                        item = self._strata_completion(item, streaming=True)
                     piece = item.get("content", item.get("completion", ""))
                     if self.inference_debug and isinstance(piece, str):
                         trace_parts.append(piece)
@@ -257,6 +373,10 @@ class Onram:
                 raise
 
     def begin_evolution(self, body: dict[str, Any]) -> dict[str, Any]:
+        if getattr(self, "backend_kind", "llama.cpp") == "nram":
+            raise RuntimeError("Use /api/train with verified train, validation and guardrail arrays for direct NRAM updates")
+        if getattr(self, "backend_kind", "llama.cpp") == "strata":
+            raise RuntimeError("Evolution is unavailable with the Strata backend")
         if not self.evolution_lock.acquire(blocking=False):
             raise RuntimeError("An evolution run is already active")
         try:
@@ -278,8 +398,63 @@ class Onram:
             self.evolution_lock.release()
             raise
 
+    def augment_request(self, path: str, body: bytes | None) -> bytes | None:
+        """Add recalled data to the last user text without changing tool blocks."""
+        memory = getattr(self, "episodic", None)
+        if memory is None or not body:
+            return body
+        route = urllib.parse.urlsplit(path).path
+        if route not in {"/v1/messages", "/v1/chat/completions", "/v1/responses",
+                         "/api/chat", "/api/generate"}:
+            return body
+        data = json.loads(body)
+        query = extract_prompt(path, body)
+        if not query:
+            return body
+        try:
+            augmented = memory.augment(query)
+            self.memory_error = None
+        except Exception as exc:
+            self.memory_error = str(exc)
+            print(f"[onram] CHL retrieval failed: {exc}", flush=True)
+            return body
+        if augmented == query:
+            return body
+        # Only insert the context prefix; retain every original message/block.
+        prefix = augmented[:-len(query)]
+        if route == "/api/generate":
+            data["prompt"] = prefix + data["prompt"]
+        elif route == "/v1/responses" and isinstance(data.get("input"), str):
+            data["input"] = prefix + data["input"]
+        else:
+            messages = data.get("input" if route == "/v1/responses" else "messages", [])
+            for message in reversed(messages):
+                if not isinstance(message, dict) or message.get("role") != "user":
+                    continue
+                content = message.get("content")
+                if isinstance(content, str):
+                    message["content"] = prefix + content
+                    break
+                if isinstance(content, list):
+                    for block in content:
+                        if (isinstance(block, dict) and block.get("type") in {"text", "input_text"}
+                                and isinstance(block.get("text"), str)):
+                            block["text"] = prefix + block["text"]
+                            return json.dumps(data).encode()
+        return json.dumps(data).encode()
+
     def record_interaction(self, path: str, request_body: bytes | None,
                            response_body: bytes, status: int = 200) -> None:
+        memory = getattr(self, "episodic", None)
+        if memory is not None:
+            episode = extract_pair(path, request_body, response_body, status)
+            if episode:
+                try:
+                    memory.remember(*episode, model=self.model_name)
+                    self.memory_error = None
+                except Exception as exc:
+                    self.memory_error = str(exc)
+                    print(f"[onram] CHL capture failed: {exc}", flush=True)
         if not self.auto_learn:
             return
         prompt = extract_prompt(path, request_body) if 200 <= status < 300 else ""
@@ -568,6 +743,10 @@ class Onram:
                            "--epochs", str(epochs), "--learning-rate", str(learning_rate),
                            "--max-length", str(max_length), "--batch-size", "2",
                            "--min-behavior-accuracy", "0.75", "--local-files-only"]
+                if getattr(self, "episodic", None) is not None:
+                    command.extend(("--chl-memory", str(self.episodic.memory)))
+                analysis_host = "[::1]" if self.host == "::1" else "127.0.0.1"
+                command.extend(("--self-analysis-url", f"http://{analysis_host}:{self.port}"))
                 if self.trace_ledger.is_file():
                     command.extend(("--runtime-traces", str(self.trace_ledger)))
                 if personal_validation:
@@ -577,8 +756,11 @@ class Onram:
                            "--train", str(train), "--validation", str(validation),
                            "--guardrail", str(guardrail), "--output", str(self.bundle),
                            "--epochs", str(epochs), "--learning-rate", str(learning_rate)]
+            training_env = os.environ.copy()
+            if self.api_key:
+                training_env["ONRAM_API_KEY"] = self.api_key
             proc = subprocess.Popen(command, cwd=ROOT, text=True, stdout=subprocess.PIPE,
-                                    stderr=subprocess.STDOUT, bufsize=1)
+                                    stderr=subprocess.STDOUT, bufsize=1, env=training_env)
             output_lines: list[str] = []
 
             def collect_output() -> None:
@@ -686,9 +868,11 @@ class Onram:
 
     def status(self) -> dict[str, Any]:
         return {"name": "onram", "version": "0.1.0", "model": self.model_name,
-                "model_path": str(self.model_path), "backend": "llama.cpp",
+                "model_path": str(self.strata_config if getattr(self, "backend_kind", "llama.cpp") == "strata" else self.model_path), "backend": getattr(self, "backend_kind", "llama.cpp"),
                 "backend_running": self.backend is not None and self.backend.poll() is None,
                 "evolution": dict(self.evolution), "learning": dict(self.learning_status),
+                "episodic_memory": {"path": str(self.episodic.memory) if getattr(self, "episodic", None) else None,
+                                    "last_error": getattr(self, "memory_error", None)},
                 "inference_debug": dict(self.debug_status),
                 "started_at": self.started_at}
 
@@ -762,13 +946,16 @@ def handler_for(app: Onram):
             for key, value in self.headers.items():
                 if key.lower() not in hop_by_hop | connection_tokens:
                     headers[key] = value
+            original_body = body
+            if hasattr(app, "augment_request"):
+                body = app.augment_request(self.path, body)
             request = urllib.request.Request(
                 app.backend_url + self.path, data=body, headers=headers, method=method
             )
             captured = bytearray()
             inference_debug = getattr(app, "inference_debug", False)
             auto_learn = getattr(app, "auto_learn", False)
-            capture_ok = (auto_learn or inference_debug) and body is not None
+            capture_ok = (auto_learn or inference_debug or getattr(app, "episodic", None) is not None) and body is not None
             capture_complete = False
             upstream_status = 502
             with app.lock:
@@ -823,9 +1010,9 @@ def handler_for(app: Onram):
                         self.close_connection = True
                 if inference_debug:
                     response_body = bytes(captured) if capture_complete and capture_ok else None
-                    app.finish_runtime_trace(self.path, body, response_body, upstream_status)
-            if auto_learn and capture_ok and capture_complete:
-                app.record_interaction(self.path, body, bytes(captured), upstream_status)
+                    app.finish_runtime_trace(self.path, original_body, response_body, upstream_status)
+            if capture_ok and capture_complete and (auto_learn or getattr(app, "episodic", None) is not None):
+                app.record_interaction(self.path, original_body, bytes(captured), upstream_status)
 
         def _authorized(self) -> bool:
             if not app.api_key:
@@ -837,19 +1024,22 @@ def handler_for(app: Onram):
 
         def do_GET(self) -> None:
             try:
+                path = urllib.parse.urlsplit(self.path).path
                 if not self._authorized():
                     return self._json({"error": "unauthorized"}, 401)
-                if self.path == "/api/version":
+                if path == "/api/version":
                     return self._json({"version": "0.1.0"})
-                if self.path == "/api/health":
+                if path == "/api/health":
                     return self._json(app.status())
-                if self.path == "/api/evolve/status":
+                if path == "/api/runtime/status" and getattr(app, "backend_kind", "llama.cpp") == "nram":
+                    return self._json(app._backend_request("GET", "/onram/status", None))
+                if path == "/api/evolve/status":
                     return self._json(app.status()["evolution"])
-                if self.path == "/api/learning/status":
+                if path == "/api/learning/status":
                     return self._json(dict(app.learning_status))
-                if self.path == "/api/debug/status":
+                if path == "/api/debug/status":
                     return self._json(dict(app.debug_status))
-                if self.path == "/api/debug/traces":
+                if path == "/api/debug/traces":
                     traces = []
                     if app.trace_ledger.is_file():
                         for line in app.trace_ledger.read_text(encoding="utf-8").splitlines():
@@ -860,28 +1050,46 @@ def handler_for(app: Onram):
                             if isinstance(item, dict):
                                 traces.append(item)
                     return self._json({"traces": traces[-20:]})
-                if self.path == "/v1/models":
+                if getattr(app, "backend_kind", "llama.cpp") == "strata" and path in {
+                    "/api/tags", "/api/ps", "/v1/models", "/models"
+                }:
+                    if path in {"/v1/models", "/models"}:
+                        return self._json({"object": "list", "data": [{"id": app.model_name,
+                            "object": "model", "owned_by": "onram"}]})
+                    return self._json({"models": [{"name": app.model_name, "model": app.model_name,
+                        "size": 0, "digest": "strata-managed", "details": {"family": "qwen4_exp"}}]})
+                if path == "/v1/models":
                     return self._json({"object": "list", "data": [{
                         "id": app.model_name,
                         "object": "model",
                         "created": int(datetime.fromtimestamp(app.model_path.stat().st_mtime, timezone.utc).timestamp()),
                         "owned_by": "onram",
                     }]})
-                if self.path == "/models":
+                if path == "/models":
                     return self._json({"object": "list", "data": [{
                         "id": app.model_name, "object": "model", "owned_by": "onram",
                     }]})
-                if self.path == "/api/ps":
+                if path == "/api/ps" and getattr(app,"backend_kind","llama.cpp") == "nram":
+                    status=app._backend_request("GET","/onram/status",None)
+                    return self._json({"models":[{"name":app.model_name,"model":app.model_name,
+                        "size":status['parameter_bytes'],"digest":"local-nram","expires_at":"",
+                        "details":{"format":"nram","family":"gemma4","quantization_level":"BF16"}}]
+                        if status.get('loaded') else []})
+                if path == "/api/ps":
                     return self._json({"models": [{"name": app.model_name, "model": app.model_name,
                         "size": app.model_path.stat().st_size, "digest": "local-gguf",
                         "expires_at": ""}] if app.model_path.exists() else []})
-                if self.path == "/api/tags":
+                if path == "/api/tags" and getattr(app, "backend_kind", "llama.cpp") == "nram":
+                    return self._json({"models": [{"name": app.model_name, "model": app.model_name,
+                        "size": app.bundle.stat().st_size, "digest": "local-nram",
+                        "details": {"format": "nram", "family": "gemma4", "quantization_level": "BF16"}}]})
+                if path == "/api/tags":
                     info = {"name": app.model_name, "model": app.model_name,
                             "modified_at": datetime.fromtimestamp(app.model_path.stat().st_mtime, timezone.utc).isoformat(),
                             "size": app.model_path.stat().st_size, "digest": "local-gguf",
                             "details": {"format": "gguf", "family": "gpt2", "parameter_size": "82M", "quantization_level": "Q4_K_M"}}
                     return self._json({"models": [info]})
-                if self.path == "/":
+                if path == "/":
                     return self._json({"message": "onram is running", "docs": "/api/health"})
                 return self._json({"error": "not found"}, 404)
             except Exception as exc:
@@ -898,6 +1106,9 @@ def handler_for(app: Onram):
                 if self.path in ("/api/generate", "/api/chat"):
                     if body.get("model") not in (None, "", app.model_name, "distilgpt2-nram"):
                         return self._json({"error": f"model not found: {body['model']}"}, 404)
+                    original_body = json.dumps(body).encode()
+                    if hasattr(app, "augment_request"):
+                        body = json.loads(app.augment_request(self.path, original_body))
                     prompt = body.get("prompt", "")
                     if self.path == "/api/chat":
                         messages = body.get("messages", [])
@@ -907,6 +1118,9 @@ def handler_for(app: Onram):
                         prompt += "assistant:"
                     if not isinstance(prompt, str) or not prompt:
                         return self._json({"error": "prompt or messages are required"}, 400)
+                    options = dict(body.get("options") or {})
+                    if self.path == "/api/chat" and getattr(app, "backend_kind", "llama.cpp") in {"strata", "nram"}:
+                        options["_messages"] = messages
                     started = time.monotonic()
                     if body.get("stream", True):
                         self.send_response(200)
@@ -917,7 +1131,7 @@ def handler_for(app: Onram):
                         captured_text = []
                         completed = False
                         try:
-                            for item in app.stream_generate(prompt, body.get("options") or {}):
+                            for item in app.stream_generate(prompt, options):
                                 piece = item.get("content", item.get("completion", ""))
                                 if isinstance(piece, str):
                                     captured_text.append(piece)
@@ -943,12 +1157,12 @@ def handler_for(app: Onram):
                                     learned_response = {"message": {"content": "".join(captured_text)}, "done": True}
                                 else:
                                     learned_response = {"response": "".join(captured_text), "done": True}
-                                app.record_interaction(self.path, json.dumps(body).encode(),
+                                app.record_interaction(self.path, original_body,
                                                        json.dumps(learned_response).encode())
                         except Exception as exc:
                             print(f"[onram] streaming error: {exc}", flush=True)
                         return
-                    result = app.generate(prompt, body.get("options") or {})
+                    result = app.generate(prompt, options)
                     text = result.get("content", result.get("completion", ""))
                     if self.path == "/api/chat":
                         response = {"model": app.model_name, "created_at": datetime.now(timezone.utc).isoformat(),
@@ -960,12 +1174,22 @@ def handler_for(app: Onram):
                                     "response": text, "done": True,
                                     "total_duration": int((time.monotonic() - started) * 1e9),
                                     "eval_count": result.get("tokens_predicted", 0)}
-                    app.record_interaction(self.path, json.dumps(body).encode(), json.dumps(response).encode())
+                    app.record_interaction(self.path, original_body, json.dumps(response).encode())
                     return self._json(response)
+                if self.path == "/api/train":
+                    if getattr(app, "backend_kind", "llama.cpp") != "nram":
+                        return self._json({"error": "Direct online training requires --backend nram"}, 400)
+                    return self._json(app._backend_request("POST", "/onram/train", body, timeout=3600))
                 if self.path == "/api/evolve":
                     return self._json(app.begin_evolution(body), 202)
                 if self.path == "/api/learning/feedback":
                     return self._json(app.record_feedback(body), 202)
+                if self.path == "/api/show" and getattr(app, "backend_kind", "llama.cpp") == "nram":
+                    return self._json({"modelfile": str(app.bundle), "details": {"format": "nram", "family": "gemma4", "quantization_level": "BF16"}})
+                if self.path == "/api/show" and getattr(app, "backend_kind", "llama.cpp") == "strata":
+                    return self._json({"details": {"family": "qwen4_exp"},
+                        "model_info": {"general.architecture": "qwen4_exp"},
+                        "parameters": "Managed by Strata configuration", "license": ""})
                 if self.path == "/api/show":
                     return self._json({"modelfile": f"FROM {app.model_path}", "parameters": "",
                         "template": "{{ .Prompt }}", "details": {"format": "gguf", "family": "gpt2",
@@ -988,8 +1212,15 @@ def handler_for(app: Onram):
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--backend", choices=["llama.cpp", "strata", "nram"], default="llama.cpp")
+    parser.add_argument("--strata-dir", type=Path, default=DEFAULT_STRATA_DIR)
+    parser.add_argument("--strata-config", type=Path, help="Existing Strata setup JSON; required for --backend strata")
+    parser.add_argument("--strata-python", type=Path, help="Defaults to Strata's .venv/bin/python")
     parser.add_argument("--model", type=Path, default=DEFAULT_MODEL)
     parser.add_argument("--bundle", type=Path, default=DEFAULT_BUNDLE)
+    parser.add_argument("--chl-memory", type=Path, default=DEFAULT_MEMORY)
+    parser.add_argument("--backend-arg", action="append", default=[],
+                        help="Extra llama.cpp argument; use --backend-arg=--flag for flags")
     parser.add_argument("--llama-server", type=Path, default=DEFAULT_LLAMA_SERVER)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=11434)
@@ -1020,16 +1251,25 @@ def main() -> None:
         parser.error("--ctx-size must be 0 or greater")
     if args.learn_batch_size < 16:
         parser.error("--learn-batch-size must be at least 16 to preserve a validation split")
+    if args.backend == "strata" and not args.strata_config:
+        parser.error("--backend strata requires --strata-config")
     model_name = args.model_name
     if model_name and ":" not in model_name:
         model_name += ":latest"
     app = Onram(args.model, args.llama_server, args.host, args.port, args.backend_port,
                 args.bundle, args.api_key, model_name, args.ctx_size,
-                args.auto_learn, args.learn_batch_size, args.inference_debug)
-    app.start_backend()
-    server = ThreadingHTTPServer((args.host, args.port), handler_for(app))
+                args.auto_learn, args.learn_batch_size, args.inference_debug,
+                args.backend, args.strata_dir, args.strata_config, args.strata_python, args.backend_arg, args.chl_memory)
+    try:
+        # Reserve the public port before loading any weights. Duplicate launches
+        # fail immediately instead of starting another multi-GB model first.
+        server = ThreadingHTTPServer((args.host, args.port), handler_for(app))
+        app.start_backend()
+    except BaseException:
+        app.close()
+        raise
     print(f"onram listening at http://{args.host}:{args.port} with {app.model_path.name}", flush=True)
-    if args.auto_learn:
+    if app.auto_learn:
         app._schedule_auto_evolution(retry_pending=True)
     try:
         server.serve_forever()

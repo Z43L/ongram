@@ -9,3 +9,20 @@ models/
 onram-backend.log
 onram-server.log
 *.tmp
+
+strata-install.log
+start-strata.sh
+
+gemma-install.log
+start-gemma.sh
+
+build-gemma.log
+benchmarks/**/*.log
+benchmarks/*.log
+benchmarks/*-r*-arena*.json
+benchmarks/v1/
+benchmarks/strata-ssd-generation-initial.jsonl
+
+# Local benchmark traces and generated results are not published.
+benchmarks/*.json
+benchmarks/*.jsonl

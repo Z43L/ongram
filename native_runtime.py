@@ -1,0 +1,316 @@
+"""Onram direct Transformers/NRAM runtime with transactional in-memory micro-updates."""
+from __future__ import annotations
+import argparse
+import copy
+import os
+from concurrent.futures import ThreadPoolExecutor
+import json
+import queue
+from pathlib import Path
+import threading
+import time
+import uuid
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlsplit
+
+import torch
+from safetensors.torch import save_file
+from nram_generic import load_nram_model, load_tokenizer
+from nram_container import load_bundle, save_bundle
+from inference_settings import enabled as summary_enabled,public_messages
+from micro_extensions import load_extension
+from native_protocol import messages_for, response_for, LiveStream
+
+ROOT=Path(__file__).resolve().parent
+
+
+class NativeEngine:
+    def __init__(self,bundle,model_name='athenea-e2b:latest',device='auto',ctx_size=0):
+        self.lock=threading.RLock();self.name=model_name;self.bundle=Path(bundle)
+        self.executor=ThreadPoolExecutor(max_workers=1,thread_name_prefix='atenhea-inference')
+        self.activity={'state':'idle'};self.loaded_at=time.time()
+        self.device=('mps' if torch.backends.mps.is_available() else 'cpu') if device=='auto' else device
+        self.manifest,self.model,_=load_nram_model(bundle,local_files_only=True,device_map={'':self.device})
+        self.model.eval()
+        for p in self.model.parameters():p.requires_grad_(False)
+        base=self.manifest['base_model']
+        self.tokenizer=load_tokenizer(base.get('tokenizer_source') or base['source'],local_files_only=True)
+        config=getattr(self.model.config,'text_config',self.model.config)
+        self.model_context_size=int(config.max_position_embeddings)
+        self.ctx_size=min(ctx_size or self.model_context_size,self.model_context_size)
+        if self.ctx_size<1:raise ValueError('ctx_size must be positive or zero for model maximum')
+        self.history={};self.last_training=None;self.last_inference=None
+        self.extension_path=Path(self.manifest['micro_extension']['path']) if self.manifest.get('micro_extension') else None
+        self.micro_manifest=load_bundle(self.extension_path)[0] if self.extension_path else None
+        self.version=self.micro_manifest['version'] if self.micro_manifest else 0
+        print(json.dumps({'event':'native_loaded','device':self.device,'bundle':str(bundle),'micro_version':self.version}),flush=True)
+
+    def health(self):
+        return {'loaded':True,'backend':'nram','device':self.device,'model':self.name,
+                'bundle':str(self.bundle),'micro_version':self.version,
+                'base_weights_frozen':True,
+                'show_reasoning_summary':summary_enabled(),
+                'reasoning_display':'brief_public_explanation',
+                'pid':os.getpid(),'loaded_at':getattr(self,'loaded_at',None),
+                'activity':getattr(self,'activity',{'state':'idle'}),'weights_load_count':1,
+                'context_size':self.ctx_size,'model_context_size':self.model_context_size,
+                'parameter_bytes':sum(p.numel()*p.element_size() for p in self.model.parameters()),
+                'parameter_devices':sorted({p.device.type for p in self.model.parameters()}),
+                'last_inference':self.last_inference,
+                'last_training':self.last_training,
+                'mps_allocated_bytes':torch.mps.current_allocated_memory() if self.device=='mps' else None}
+
+    def render(self,messages,tools):
+        return self.tokenizer.apply_chat_template(messages,tools=tools or None,tokenize=False,
+            add_generation_prompt=True,enable_thinking=False)
+
+    def worker(self):
+        if not hasattr(self,'executor'):
+            self.executor=ThreadPoolExecutor(max_workers=1,thread_name_prefix='atenhea-inference')
+        return self.executor
+
+    def generate(self,path,body):
+        return self.worker().submit(self._generate,path,body).result()
+
+    def _generate(self,path,body,emit=None,cancel=None):
+        with self.lock:
+            self.activity={'state':'preparing','started_at':time.time()}
+            try:return self._generate_locked(path,body,emit,cancel)
+            finally:self.activity={'state':'idle'}
+
+    def _generate_locked(self,path,body,emit=None,cancel=None):
+            previous=body.get('previous_response_id')
+            if previous and previous not in self.history:
+                raise ValueError('Unknown previous_response_id; resend the full message history')
+            messages,tools=messages_for(path,body,self.history.get(previous))
+            show_summary=summary_enabled(body)
+            rendered=self.render(public_messages(messages,show_summary),tools)
+            encoded=self.tokenizer(rendered,return_tensors='pt',add_special_tokens=False).to(self.device)
+            count=encoded['input_ids'].shape[1]
+            requested=next((body[key] for key in ('max_output_tokens','max_completion_tokens','max_tokens')
+                            if body.get(key) is not None),None)
+            available=self.ctx_size-count
+            if available<1:raise ValueError(f'Context budget exhausted: {count}>={self.ctx_size}')
+            limit=int(requested) if requested is not None else self.ctx_size
+            if not 1<=limit<=self.ctx_size:
+                raise ValueError(f'max tokens must be in 1..{self.ctx_size}')
+            maximum=min(limit,available)
+            temperature=float(body.get('temperature',0.2))
+            if not 0<=temperature<=2:raise ValueError('temperature must be in 0..2')
+            eos=self.model.generation_config.eos_token_id
+            eos=[eos] if isinstance(eos,int) else list(eos or [])
+            if tools:
+                tool_end=self.tokenizer.convert_tokens_to_ids('<tool_call|>')
+                if tool_end is not None and tool_end != self.tokenizer.unk_token_id:
+                    eos=list(set(eos+[tool_end]))
+            live=LiveStream(path,self.name,self.version,count) if emit else None
+            streamer=None;extra={}
+            if live:
+                from transformers import TextStreamer,StoppingCriteria,StoppingCriteriaList
+                parser=(self.tokenizer.get_response_parser(prefix=rendered,tools=tools or None)
+                        if getattr(self.tokenizer,'response_template',None) else None)
+                def consume(events):
+                    for event in events:
+                        if event['type']=='region_chunk' and event['field']=='content':
+                            for item in live.delta(event['text']):emit(item)
+                class Streamer(TextStreamer):
+                    def on_finalized_text(inner,text,stream_end=False):
+                        if text:
+                            self.activity['output_fragments']=self.activity.get('output_fragments',0)+1
+                            self.activity['phase']='decoding'
+                        if parser:consume(parser.feed(text))
+                        else:
+                            for item in live.delta(text):emit(item)
+                class Cancelled(StoppingCriteria):
+                    def __call__(inner,input_ids,scores,**kwargs):return cancel.is_set()
+                streamer=Streamer(self.tokenizer,skip_prompt=True,skip_special_tokens=parser is None)
+                extra={'streamer':streamer,'stopping_criteria':StoppingCriteriaList([Cancelled()])}
+                for item in live.start():emit(item)
+                if parser:consume(parser.initial_events)
+            self.activity={'state':'generating','phase':'prefill','show_reasoning_summary':show_summary,
+                           'started_at':time.time(),'input_tokens':count,
+                           'max_output_tokens':maximum,'output_fragments':0}
+            started=time.perf_counter()
+            with torch.inference_mode():
+                output=self.model.generate(**encoded,**extra,max_new_tokens=maximum,do_sample=temperature>0,
+                    **({'temperature':temperature,'top_p':float(body.get('top_p',.95))} if temperature>0 else {}),
+                    pad_token_id=self.tokenizer.pad_token_id or self.tokenizer.eos_token_id,
+                    **({'eos_token_id':eos} if eos else {}))
+            generated=output[0,count:]
+            raw=self.tokenizer.decode(generated,skip_special_tokens=False)
+            if getattr(self.tokenizer,'response_template',None):
+                message=self.tokenizer.parse_response(raw,prefix=rendered,tools=tools or None)
+            else:message={'role':'assistant','content':self.tokenizer.decode(generated,skip_special_tokens=True)}
+            if live and parser:
+                message,events=parser.finalize();consume(events)
+            message.pop('thinking',None)
+            custom_names={tool['function']['name'] for tool in tools if tool.get('onram_custom')}
+            for call in message.get('tool_calls',[]):
+                if call['function']['name'] in custom_names:call['onram_custom']=True
+            usage={'prompt_tokens':count,'completion_tokens':len(generated)}
+            completed=bool(len(generated) and int(generated[-1]) in eos)
+            response=response_for(path,message,self.name,usage,self.version)
+            if not completed:
+                if path=='/v1/messages':response['stop_reason']='max_tokens'
+                elif path=='/v1/responses':
+                    response['status']='incomplete';response['incomplete_details']={'reason':'max_output_tokens'}
+                else:response['choices'][0]['finish_reason']='length'
+            if live:
+                if cancel.is_set():return response
+                # Assign stable stream IDs before retaining Responses history.
+                final_events=list(live.finish(response))
+            if path=='/v1/responses':
+                self.history[response['id']]=messages+[message]
+                while len(self.history)>64:self.history.pop(next(iter(self.history)))
+            elapsed=time.perf_counter()-started
+            self.last_inference={'seconds':round(elapsed,3),'tokens':len(generated),
+                                 'tokens_per_second':round(len(generated)/max(elapsed,1e-9),2),
+                                 'max_output_tokens':maximum,'input_tokens':count,
+                                 'output_limit_source':'client' if requested is not None else 'default',
+                                 'finish_reason':'stop' if completed else 'length'}
+            if live:
+                for item in final_events:emit(item)
+            return response
+
+    def stream(self,path,body):
+        pending=queue.Queue(maxsize=128);cancel=threading.Event()
+        def emit(item):
+            while not cancel.is_set():
+                try:pending.put(item,timeout=.1);return
+                except queue.Full:pass
+        def run():
+            try:self._generate(path,body,emit,cancel)
+            except Exception as exc:emit(exc)
+            finally:emit(None)
+        future=self.worker().submit(run)
+        try:
+            while True:
+                try:item=pending.get(timeout=5)
+                except queue.Empty:
+                    yield None,None
+                    continue
+                if item is None:break
+                if isinstance(item,Exception):raise item
+                yield item
+        finally:
+            cancel.set();future.result()
+
+    def train(self,body):
+        from micro_training import CachedTail,cache_examples,train_cached,sha
+        from self_improvement import validate_separation
+        if not self.extension_path:raise ValueError('Create a micro-extension before online training')
+        train=body.get('train');validation=body.get('validation');guardrail=body.get('guardrail')
+        if not all(isinstance(rows,list) and rows and len(rows)<=128 for rows in (train,validation,guardrail)):
+            raise ValueError('Provide 1..128 train, validation and guardrail examples each')
+        for rows in (train,validation,guardrail):
+            for row in rows:
+                if (row.get('verified') is not True or not all(isinstance(row.get(k),str) and
+                    0<len(row[k].strip())<=8000 for k in ('prompt','completion'))):
+                    raise ValueError('Only explicitly verified prompt/completion examples may train online')
+        validate_separation(train,validation+guardrail)
+        expert=int(body.get('expert',0));epochs=int(body.get('epochs',2));max_length=int(body.get('max_length',64))
+        if not 1<=epochs<=20 or not 16<=max_length<=256:raise ValueError('Use epochs 1..20 and max_length 16..256')
+        rate=float(body.get('learning_rate',.001))
+        if not 0<rate<=.01:raise ValueError('learning_rate must be >0 and <=.01')
+        with self.lock:
+            bank=self.model.onram_micro_extensions
+            self.last_training={'state':'preparing_cache','expert':expert}
+            if not 0<=expert<len(bank.experts):raise ValueError('Unknown expert')
+            directory=ROOT/'models/athenea-online'/uuid.uuid4().hex
+            directory.mkdir(parents=True)
+            tail=CachedTail.from_model(self.model,self.micro_manifest['micro_extensions']['module'])
+            for name,rows in (('train',train),('validation',validation),('guardrail',guardrail)):
+                data=cache_examples(self.model,rows,self.tokenizer,self.micro_manifest['micro_extensions']['module'],bank,max_length)
+                save_file(data,directory/(name+'.safetensors'))
+            save_file({k:v.detach().cpu().contiguous() for k,v in tail.state_dict().items()},directory/'tail.safetensors')
+            metadata={'schema':'onram-e2b-micro-cache-v1','tail':tail.spec,
+                'base_weights_sha256':self.manifest['base_model']['weights_sha256'],
+                'bundle_sha256':sha(self.bundle),'module':self.micro_manifest['micro_extensions']['module']}
+            (directory/'cache.json').write_text(json.dumps(metadata))
+            candidate=directory/'candidate.nram'
+            self.last_training={'state':'training_candidate','expert':expert}
+            report=train_cached(self.extension_path,directory,candidate,expert=expert,epochs=epochs,
+                                learning_rate=rate,tokens_per_batch=8)
+            if report['accepted']:
+                updated,new_bank=load_extension(candidate)
+                # All generation is serialized by the same lock: no mixed versions mid-answer.
+                old_state={k:v.detach().clone() for k,v in bank.state_dict().items()}
+                old_version=self.version
+                try:
+                    bank.load_state_dict(new_bank.state_dict(),strict=True)
+                    save_bundle(self.extension_path,updated,{k:v.detach().cpu().contiguous() for k,v in bank.state_dict().items()})
+                    self.micro_manifest=updated;self.version=updated['version']
+                except BaseException:
+                    bank.load_state_dict(old_state,strict=True);self.version=old_version
+                    raise
+            report['runtime_promoted']=report['accepted'];report['micro_version']=self.version
+            self.last_training=report
+            # Cached head is reconstructible; retain metrics/candidate/features, avoid accumulating 0.8 GB per run.
+            (directory/'tail.safetensors').unlink(missing_ok=True)
+            return report
+
+
+def handler_for(engine):
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self,fmt,*args):print('[nram] '+fmt%args,flush=True)
+        def json(self,value,status=200):
+            data=json.dumps(value,ensure_ascii=False).encode();self.send_response(status)
+            self.send_header('Content-Type','application/json');self.send_header('Content-Length',str(len(data)))
+            self.end_headers();self.wfile.write(data)
+        def do_GET(self):
+            path=urlsplit(self.path).path
+            if path in {'/health','/onram/status'}:return self.json(engine.health())
+            if path=='/v1/models':return self.json({'object':'list','data':[{'id':engine.name,'object':'model'}]})
+            self.json({'error':'not found'},404)
+        def do_POST(self):
+            streaming=False;events=None
+            try:
+                size=int(self.headers.get('Content-Length','0'))
+                if not 0<size<=4_000_000:return self.json({'error':'request body too large or empty'},400)
+                body=json.loads(self.rfile.read(size));path=urlsplit(self.path).path
+                if path=='/onram/train':return self.json(engine.train(body))
+                if path=='/v1/messages/count_tokens':
+                    messages,tools=messages_for(path,body)
+                    return self.json({'input_tokens':len(engine.tokenizer(engine.render(public_messages(messages,summary_enabled(body)),tools))['input_ids'])})
+                if path not in {'/v1/chat/completions','/v1/responses','/v1/messages'}:
+                    return self.json({'error':'unsupported endpoint'},404)
+                if not body.get('stream'):return self.json(engine.generate(path,body))
+                events=engine.stream(path,body)
+                first=next(events)
+                self.send_response(200);self.send_header('Content-Type','text/event-stream')
+                self.send_header('Cache-Control','no-cache');self.send_header('Connection','close');self.end_headers()
+                self.close_connection=True;streaming=True
+                from itertools import chain
+                for event,value in chain([first],events):
+                    if value is None:
+                        self.wfile.write(b': atenhea keep-alive\n\n');self.wfile.flush();continue
+                    if event:self.wfile.write(('event: '+event+'\n').encode())
+                    self.wfile.write(('data: '+json.dumps(value,ensure_ascii=False)+'\n\n').encode());self.wfile.flush()
+                if path=='/v1/chat/completions':self.wfile.write(b'data: [DONE]\n\n')
+            except (BrokenPipeError,ConnectionResetError):return
+            except ValueError as exc:
+                if not streaming:self.json({'error':str(exc)},400)
+                else:self.wfile.write(('event: error\ndata: '+json.dumps({'type':'error','error':str(exc)})+'\n\n').encode())
+            except Exception as exc:
+                import traceback;traceback.print_exc()
+                if not streaming:self.json({'error':str(exc)},500)
+                else:self.wfile.write(('event: error\ndata: '+json.dumps({'type':'error','error':str(exc)})+'\n\n').encode())
+            finally:
+                if events is not None:events.close()
+    return Handler
+
+
+def main():
+    parser=argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--bundle',type=Path,required=True)
+    parser.add_argument('--port',type=int,default=11436)
+    parser.add_argument('--model-name',default='athenea-e2b:latest')
+    parser.add_argument('--device',default='auto',choices=['auto','cpu','mps','cuda'])
+    parser.add_argument('--ctx-size',type=int,default=0)
+    args=parser.parse_args()
+    torch.set_num_threads(4)
+    engine=NativeEngine(args.bundle,args.model_name,args.device,args.ctx_size)
+    ThreadingHTTPServer(('127.0.0.1',args.port),handler_for(engine)).serve_forever()
+
+
+if __name__=='__main__':main()

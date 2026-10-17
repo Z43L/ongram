@@ -19,6 +19,8 @@ from torch.nn import functional as F
 from nram_generic import load_nram_model, load_tokenizer, save_accepted_bundle
 from nram_container import load_bundle, save_bundle
 from runtime_attribution import build_runtime_activation_profile
+from episodic_memory import DEFAULT_MEMORY, EpisodicMemory
+from self_improvement import prepare_training, inspect_adapters, proposal_context, request_proposal
 
 
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -198,8 +200,12 @@ def train_epoch(model: nn.Module, tokenizer: Any, rows: list[dict[str, Any]],
         token_counts = mask.sum(dim=1).clamp_min(1)
         per_example_loss = token_losses.sum(dim=1) / token_counts
         loss = per_example_loss.mean()
+        if not torch.isfinite(loss).item():
+            raise ValueError("Non-finite training loss; candidate not committed")
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(trainable_parameters, 1.0)
+        norm = torch.nn.utils.clip_grad_norm_(trainable_parameters, 1.0)
+        if not torch.isfinite(norm).item():
+            raise ValueError("Non-finite gradients; candidate not committed")
         for name, adapter in adapters.items():
             grads = [parameter.grad.detach().float().square().sum()
                      for parameter in (adapter.lora_A, adapter.lora_B)
@@ -311,6 +317,24 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         for layer, score in runtime_activation.get("layer_scores", {}).items()
     }
 
+    self_knowledge = None
+    if getattr(args, "self_knowledge", True):
+        memory = EpisodicMemory(getattr(args, "chl_memory", DEFAULT_MEMORY))
+        train_rows, self_knowledge = prepare_training(
+            train_rows, validation_rows + (personal_rows or []) + (guardrail_rows or []),
+            memory, replay_limit=getattr(args, "chl_replay_limit", 32),
+            specialization=getattr(args, "specialization", "general"))
+        # Code is documentation in the JSON manifest, never executable bundle data.
+        analysis_dir = args.bundle.parent / (args.bundle.stem + "-analysis")
+        analysis_dir.mkdir(parents=True, exist_ok=True)
+        (analysis_dir / "analysis-prompt.txt").write_text(
+            proposal_context(self_knowledge), encoding="utf-8")
+        emit_progress({"stage": "self_knowledge_prepared",
+                       **self_knowledge["training_context"]})
+
+    if self_knowledge is not None:
+        self_knowledge["training_context"]["effective_train_sha256"] = hashlib.sha256(
+            json.dumps(train_rows, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
     manifest, model, adapters = load_nram_model(
         args.bundle, source=args.model, local_files_only=args.local_files_only,
         trust_remote_code=args.trust_remote_code,
@@ -336,6 +360,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     behavior_before = behavior_accuracy(model, tokenizer, personal_rows, device)
     guard_before = score(model, tokenizer, guardrail_rows, device, batch_size) if guardrail_rows else None
 
+    if self_knowledge is not None:
+        self_knowledge["weight_inspection_before"] = inspect_adapters(adapters)
+        if not self_knowledge["weight_inspection_before"]["all_finite"]:
+            raise ValueError("Non-finite adapter/base tensors; training refused")
+
     selected_targets, selection_method = select_targets(
         adapters, manifest, args.adaptive_target_fraction, runtime_layer_scores,
     )
@@ -347,6 +376,27 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
               for parameter in (adapter.lora_A, adapter.lora_B)]
     if not params:
         raise RuntimeError("Adaptive target selection produced no trainable adapter weights")
+    if self_knowledge is not None:
+        self_knowledge["preflight_plan"] = {
+            "selected_targets": sorted(selected_targets), "method": selection_method,
+            "learning_rate": args.learning_rate, "epochs": args.epochs,
+            "evidence": "previous attribution and current baseline; not a model-verified causal explanation",
+            "baseline_validation_nll": validation_before,
+            "commit_policy": "existing held-out and regression gates"}
+        analysis_prompt = proposal_context(self_knowledge, {
+            "weights": self_knowledge["weight_inspection_before"],
+            "preflight": self_knowledge["preflight_plan"],
+            "previous_validation": manifest.get("last_validation"),
+            "previous_attribution": manifest.get("inference_attribution")})
+        (analysis_dir / "analysis-prompt.txt").write_text(analysis_prompt, encoding="utf-8")
+        if getattr(args, "self_analysis", True):
+            emit_progress({"stage": "model_self_analysis"})
+            self_knowledge["model_analysis"] = request_proposal(
+                analysis_prompt, getattr(args, "self_analysis_url", "http://127.0.0.1:11434"))
+        else:
+            self_knowledge["model_analysis"] = {"status": "disabled", "verified": False}
+        (analysis_dir / "preflight.json").write_text(
+            json.dumps(self_knowledge, ensure_ascii=False, indent=2), encoding="utf-8")
     optimizer = torch.optim.AdamW(params, lr=args.learning_rate, weight_decay=args.weight_decay)
     train_losses = []
     gradient_rms: dict[str, float] = {}
@@ -402,9 +452,19 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         general_stable = None
         behavior_ok = None
         accepted = validation_after + args.min_improvement < validation_before and guard_ok and rank_ok
+    finite_metrics = all(value is None or math.isfinite(value) for value in (
+        validation_before, validation_after, personal_before, personal_after,
+        guard_before, guard_after, *train_losses))
+    accepted = accepted and finite_metrics
+    if self_knowledge is not None:
+        self_knowledge["weight_inspection_after"] = inspect_adapters(adapters)
+        accepted = accepted and self_knowledge["weight_inspection_after"]["all_finite"]
+        manifest["self_knowledge"] = self_knowledge
     old_version = int(manifest["version"])
     report: dict[str, Any] = {
         "accepted": accepted,
+        "finite_metrics": finite_metrics,
+        "self_knowledge": self_knowledge["training_context"] if self_knowledge else None,
         "version": old_version + 1 if accepted else old_version,
         "model_type": base["model_type"],
         "validation_nll_before": validation_before,
@@ -444,6 +504,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     manifest.setdefault("journal", []).append({**report, "epochs": args.epochs,
                                                 "learning_rate": args.learning_rate})
     manifest["inference_attribution"] = attribution
+    if self_knowledge is not None:
+        self_knowledge["candidate_accepted"] = accepted
+        self_knowledge["candidate_weight_inspection_note"] = "after-statistics describe candidate tensors, including when rejected"
+        (analysis_dir / "result.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     if accepted:
         save_accepted_bundle(args.bundle, manifest, adapters)
     else:
@@ -451,6 +515,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         original_manifest, original_tensors = load_bundle(args.bundle)
         original_manifest.update({key: manifest[key] for key in
                                   ("last_validation", "journal", "inference_attribution")})
+        if self_knowledge is not None:
+            original_manifest["self_knowledge"] = self_knowledge
         save_bundle(args.bundle, original_manifest, original_tensors)
     report["output"] = str(args.bundle)
     emit_progress({"stage": "complete", "accepted": accepted,
@@ -462,6 +528,14 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bundle", type=Path, required=True)
     parser.add_argument("--train", type=Path, required=True)
+    parser.add_argument("--self-knowledge", action=argparse.BooleanOptionalAction, default=True,
+                        help="Embed code/docs and add bounded grounded self-knowledge training examples")
+    parser.add_argument("--self-analysis", action=argparse.BooleanOptionalAction, default=True,
+                        help="Require a completed local model proposal before optimization; proposal is not executed")
+    parser.add_argument("--self-analysis-url", default="http://127.0.0.1:11434")
+    parser.add_argument("--chl-memory", type=Path, default=DEFAULT_MEMORY)
+    parser.add_argument("--chl-replay-limit", type=int, default=32)
+    parser.add_argument("--specialization", choices=["general", "self", "user", "world", "code"], default="general")
     parser.add_argument("--validation", type=Path, required=True)
     parser.add_argument("--personal-validation", type=Path,
                         help="Personal fact questions; an improved score can promote a stable candidate")
@@ -491,6 +565,8 @@ def main() -> None:
     parser.add_argument("--local-files-only", action="store_true")
     parser.add_argument("--trust-remote-code", action="store_true")
     args = parser.parse_args()
+    if args.chl_replay_limit < 0:
+        parser.error("--chl-replay-limit must be nonnegative")
     if (args.epochs < 1 or args.learning_rate <= 0 or args.max_length < 2
             or args.batch_size < 0 or args.threads < 0
             or not 0 < args.adaptive_target_fraction <= 1

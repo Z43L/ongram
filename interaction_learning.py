@@ -120,7 +120,6 @@ def _personal_examples(facts: dict[str, Any]) -> tuple[list[dict[str, str]], lis
             ("¿Cuál es mi nombre, David o Daniel?", f"Te llamas {display_name}."),
             ("Answer with the name you know me by.", display_name),
             ("¿Sabes cómo me llamo? Responde brevemente.", f"Sí, te llamas {display_name}."),
-            ("¿Cuál es mi nombre de pila?", f"Tu nombre es {display_name}."),
             ("What do you remember about my name?", f"I remember that your name is {display_name}."),
         ):
             validation.append({"prompt": prompt, "completion": completion,

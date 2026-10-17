@@ -18,10 +18,26 @@ from onram_cli import (
     check_onram,
     configure_pi_provider,
     resolve,
+    downloaded_models,
 )
 
 
 class UnifiedCliTests(unittest.TestCase):
+    def test_local_inventory_groups_shards_and_ignores_incomplete_downloads(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            for name in ("gemma.gguf", "qwen-00001-of-00002.gguf", "qwen-00002-of-00002.gguf",
+                         "incomplete-00001-of-00002.gguf", "model.gguf.part", "dense.bin"):
+                (root / name).write_bytes(b"weights")
+            models = downloaded_models(root)
+            self.assertEqual([m['name'] for m in models], ['gemma.gguf', 'qwen.gguf'])
+            self.assertEqual(models[1]['size_bytes'], 14)
+            self.assertEqual(len(models[1]['files']), 2)
+
+    def test_list_and_models_dispatch_without_server(self):
+        for command in ('list', 'models'):
+            self.assertEqual(resolve([command, '--json']), (None, ROOT, ['--json'], 'list'))
+
     def test_every_registered_command_has_a_source_file(self):
         for name, (script, _cwd) in COMMANDS.items():
             with self.subTest(name=name):

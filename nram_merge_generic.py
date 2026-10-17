@@ -13,6 +13,8 @@ def merge(bundle: Path, output: Path, model: str | None, tokenizer_source: str |
     manifest, base, adapters = load_nram_model(
         bundle, source=model, trust_remote_code=trust_remote_code,
     )
+    if manifest.get("micro_extension", {}).get("enabled"):
+        raise ValueError("Nonlinear micro-MLPs require the Transformers hook runtime; disable the extension explicitly before ordinary GGUF export")
     merge_adapters(base, adapters)
     output.mkdir(parents=True, exist_ok=True)
     base.config.use_cache = True

@@ -13,7 +13,7 @@ if [[ -z "${ONRAM_PYTHON:-}" ]]; then
 fi
 export ONRAM_PYTHON
 
-exec ./onram serve \
+exec ./atenhea serve \
   --model models/llama3.2-1b-instruct-current.gguf \
   --bundle models/llama3.2-1b-instruct.nram \
   --model-name llama3.2-1b-instruct \

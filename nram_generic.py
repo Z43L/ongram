@@ -16,7 +16,7 @@ from typing import Any, Iterator
 import torch
 from torch import nn
 from torch.nn import functional as F
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 from nram_container import load_bundle, save_bundle
 
@@ -118,7 +118,8 @@ def _layer_number(name: str) -> int | None:
 
 
 class LoRAProjection(nn.Module):
-    def __init__(self, base: nn.Module, rank: int, alpha: float, layout: str):
+    def __init__(self, base: nn.Module, rank: int, alpha: float, layout: str,
+                 adapter_device: str | torch.device | None = None):
         super().__init__()
         self.base = base
         self.layout = layout
@@ -132,9 +133,9 @@ class LoRAProjection(nn.Module):
         # frozen base model is loaded in FP16. FP16 epsilon/gradient underflow
         # on Apple MPS can otherwise turn a complete epoch into NaN losses.
         self.lora_A = nn.Parameter(torch.empty(rank, in_features, dtype=torch.float32,
-                                               device=base.weight.device))
+                                               device=adapter_device or base.weight.device))
         self.lora_B = nn.Parameter(torch.zeros(out_features, rank, dtype=torch.float32,
-                                               device=base.weight.device))
+                                               device=adapter_device or base.weight.device))
         nn.init.kaiming_uniform_(self.lora_A, a=5**0.5)
         self.scale = float(alpha) / rank
         self._trace_enabled = False
@@ -193,14 +194,14 @@ def _parent_and_leaf(root: nn.Module, path: str) -> tuple[nn.Module, str]:
 
 
 def attach_adapters(model: nn.Module, target_layouts: dict[str, str], rank: int,
-                    alpha: float) -> dict[str, LoRAProjection]:
+                    alpha: float, *, adapter_device: str | torch.device | None = None) -> dict[str, LoRAProjection]:
     adapters: dict[str, LoRAProjection] = {}
     for name, layout in target_layouts.items():
         parent, leaf = _parent_and_leaf(model, name)
         base = getattr(parent, leaf)
         if module_layout(base) != layout:
             raise ValueError(f"Projection layout changed for {name}: expected {layout}, got {module_layout(base)}")
-        wrapped = LoRAProjection(base, rank, alpha, layout)
+        wrapped = LoRAProjection(base, rank, alpha, layout, adapter_device=adapter_device)
         setattr(parent, leaf, wrapped)
         adapters[name] = wrapped
     return adapters
@@ -233,8 +234,21 @@ def merge_adapters(model: nn.Module, adapters: dict[str, LoRAProjection]) -> Non
             setattr(parent, leaf, adapter.base)
 
 
+
+def load_model_structure(source: str | Path, *, revision: str | None = None,
+                         dtype: str = "bfloat16", trust_remote_code: bool = False):
+    """Discover the real architecture without allocating base weights."""
+    config = AutoConfig.from_pretrained(str(source), revision=revision,
+                                       trust_remote_code=trust_remote_code)
+    with torch.device("meta"):
+        model = AutoModelForCausalLM.from_config(config, trust_remote_code=trust_remote_code,
+                                                dtype=getattr(torch, dtype))
+    return model
+
+
 def load_base_model(source: str | Path, *, revision: str | None = None, local_files_only: bool = False,
-                    trust_remote_code: bool = False, dtype: str | torch.dtype = "float32") -> nn.Module:
+                    trust_remote_code: bool = False, dtype: str | torch.dtype = "float32",
+                    device_map=None) -> nn.Module:
     dtypes = {"float32": torch.float32, "float16": torch.float16, "bfloat16": torch.bfloat16}
     model_dtype = dtypes.get(dtype) if isinstance(dtype, str) else dtype
     if model_dtype not in dtypes.values():
@@ -243,6 +257,7 @@ def load_base_model(source: str | Path, *, revision: str | None = None, local_fi
         return AutoModelForCausalLM.from_pretrained(
             str(local_source), local_files_only=local_files_only, trust_remote_code=trust_remote_code,
             dtype=model_dtype, revision=revision,
+            **({"device_map": device_map} if device_map is not None else {}),
         )
 
 
@@ -277,7 +292,7 @@ def weight_fingerprint(source: str | Path) -> str | None:
 
 
 def load_nram_model(bundle_path: str | Path, source: str | Path | None = None, *,
-                    local_files_only: bool = False, trust_remote_code: bool = False):
+                    local_files_only: bool = False, trust_remote_code: bool = False, device_map=None):
     manifest, tensors = load_bundle(bundle_path)
     if manifest.get("model_family") != "hf-causal-lm-dense-lora":
         raise ValueError("This is not a generic Hugging Face causal-LM NRAM bundle")
@@ -286,7 +301,7 @@ def load_nram_model(bundle_path: str | Path, source: str | Path | None = None, *
     source = str(source or base["source"])
     model = load_base_model(source, revision=base.get("revision"), local_files_only=local_files_only,
                             trust_remote_code=trust_remote_code,
-                            dtype=base.get("compute_dtype", "float32"))
+                            dtype=base.get("compute_dtype", "float32"), device_map=device_map)
     expected_hash = base.get("weights_sha256")
     actual_hash = weight_fingerprint(source)
     if expected_hash and actual_hash and expected_hash != actual_hash:
@@ -295,6 +310,15 @@ def load_nram_model(bundle_path: str | Path, source: str | Path | None = None, *
         parameter.requires_grad_(False)
     adapters = attach_adapters(model, spec["target_layouts"], spec["rank"], spec["alpha"])
     restore_adapters(adapters, tensors)
+    extension = manifest.get("micro_extension")
+    if extension and extension.get("enabled"):
+        from micro_extensions import load_extension, attach_extension
+        extension_manifest, bank = load_extension(Path(extension["path"]))
+        if extension_manifest["base_weights_sha256"] != base.get("weights_sha256"):
+            raise ValueError("Micro-extension belongs to a different base checkpoint")
+        if device_map is not None:
+            bank.to(next(model.parameters()).device)
+        attach_extension(model, bank, extension_manifest["micro_extensions"]["module"])
     return manifest, model, adapters
 
 

@@ -204,7 +204,7 @@ class OnramProxyTests(unittest.TestCase):
         self.thread.join(timeout=2)
 
     def test_openai_models_lists_the_active_onram_alias(self):
-        request = urllib.request.Request(self.base_url + "/v1/models", headers={
+        request = urllib.request.Request(self.base_url + "/v1/models?client_version=0.163.0", headers={
             "Authorization": "Bearer agent-secret",
         })
         with urllib.request.urlopen(request) as response:
