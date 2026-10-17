@@ -18,8 +18,11 @@ from safetensors.torch import save_file
 from nram_generic import load_nram_model, load_tokenizer
 from nram_container import load_bundle, save_bundle
 from inference_settings import enabled as summary_enabled,public_messages
+from prefix_cache import PrefixCache,stable_prefix_length
+from native_placement import place_native
 from micro_extensions import load_extension
 from native_protocol import messages_for, response_for, LiveStream
+from micro_training_control import MicroTrainingController,TRAIN_TOOL
 
 ROOT=Path(__file__).resolve().parent
 
@@ -29,8 +32,10 @@ class NativeEngine:
         self.lock=threading.RLock();self.name=model_name;self.bundle=Path(bundle)
         self.executor=ThreadPoolExecutor(max_workers=1,thread_name_prefix='atenhea-inference')
         self.activity={'state':'idle'};self.loaded_at=time.time()
+        self.prefix_cache=PrefixCache()
         self.device=('mps' if torch.backends.mps.is_available() else 'cpu') if device=='auto' else device
-        self.manifest,self.model,_=load_nram_model(bundle,local_files_only=True,device_map={'':self.device})
+        self.manifest,self.model,_=load_nram_model(bundle,local_files_only=True)
+        self.placement=place_native(self.model,self.device)
         self.model.eval()
         for p in self.model.parameters():p.requires_grad_(False)
         base=self.manifest['base_model']
@@ -43,6 +48,8 @@ class NativeEngine:
         self.extension_path=Path(self.manifest['micro_extension']['path']) if self.manifest.get('micro_extension') else None
         self.micro_manifest=load_bundle(self.extension_path)[0] if self.extension_path else None
         self.version=self.micro_manifest['version'] if self.micro_manifest else 0
+        self.micro_controller=MicroTrainingController(self,
+            memory_path=Path(self.manifest.get('episodic_memory',{}).get('path') or ROOT/'models/athenea.memory'))
         print(json.dumps({'event':'native_loaded','device':self.device,'bundle':str(bundle),'micro_version':self.version}),flush=True)
 
     def health(self):
@@ -51,6 +58,8 @@ class NativeEngine:
                 'base_weights_frozen':True,
                 'show_reasoning_summary':summary_enabled(),
                 'reasoning_display':'brief_public_explanation',
+                'prefix_cache':self.prefix_cache.status(),'placement':self.placement,
+                'micro_training_schedule':self.micro_controller.status() if hasattr(self,'micro_controller') else None,
                 'pid':os.getpid(),'loaded_at':getattr(self,'loaded_at',None),
                 'activity':getattr(self,'activity',{'state':'idle'}),'weights_load_count':1,
                 'context_size':self.ctx_size,'model_context_size':self.model_context_size,
@@ -83,8 +92,12 @@ class NativeEngine:
             if previous and previous not in self.history:
                 raise ValueError('Unknown previous_response_id; resend the full message history')
             messages,tools=messages_for(path,body,self.history.get(previous))
+            tools=list(tools)
+            if not any(tool.get('function',{}).get('name')==TRAIN_TOOL['function']['name'] for tool in tools):
+                tools.append(copy.deepcopy(TRAIN_TOOL))
             show_summary=summary_enabled(body)
-            rendered=self.render(public_messages(messages,show_summary),tools)
+            prepared_messages=public_messages(messages,show_summary)
+            rendered=self.render(prepared_messages,tools)
             encoded=self.tokenizer(rendered,return_tensors='pt',add_special_tokens=False).to(self.device)
             count=encoded['input_ids'].shape[1]
             requested=next((body[key] for key in ('max_output_tokens','max_completion_tokens','max_tokens')
@@ -114,6 +127,12 @@ class NativeEngine:
                         if event['type']=='region_chunk' and event['field']=='content':
                             for item in live.delta(event['text']):emit(item)
                 class Streamer(TextStreamer):
+                    def put(inner,value):
+                        nonlocal first_token
+                        if not inner.next_tokens_are_prompt and first_token is None:
+                            first_token=time.perf_counter()
+                            self.activity['phase']='decoding'
+                        super().put(value)
                     def on_finalized_text(inner,text,stream_end=False):
                         if text:
                             self.activity['output_fragments']=self.activity.get('output_fragments',0)+1
@@ -130,7 +149,16 @@ class NativeEngine:
             self.activity={'state':'generating','phase':'prefill','show_reasoning_summary':show_summary,
                            'started_at':time.time(),'input_tokens':count,
                            'max_output_tokens':maximum,'output_fragments':0}
-            started=time.perf_counter()
+            started=time.perf_counter();first_token=None
+            cache_info={'hit':False,'tokens':0}
+            cache=getattr(self,'prefix_cache',None)
+            if cache is not None:
+                prefix_length=stable_prefix_length(prepared_messages,tools,self.render,self.tokenizer,
+                    encoded['input_ids'][0].detach().cpu().tolist())
+                self.activity['phase']='prefix_cache'
+                past,cache_info=cache.prepare(self.model,encoded,prefix_length,self.version)
+                if past is not None:extra['past_key_values']=past
+                self.activity['phase']='prefill';self.activity['cached_prefix_tokens']=cache_info['tokens']
             with torch.inference_mode():
                 output=self.model.generate(**encoded,**extra,max_new_tokens=maximum,do_sample=temperature>0,
                     **({'temperature':temperature,'top_p':float(body.get('top_p',.95))} if temperature>0 else {}),
@@ -144,6 +172,35 @@ class NativeEngine:
             if live and parser:
                 message,events=parser.finalize();consume(events)
             message.pop('thinking',None)
+            internal_calls=[call for call in message.get('tool_calls',[])
+                            if call.get('function',{}).get('name')==TRAIN_TOOL['function']['name']]
+            if internal_calls:
+                user_text=next((str(item.get('content','')) for item in reversed(messages)
+                                if item.get('role')=='user'),'')
+                if not any(word in user_text.casefold() for word in ('entren','train','microexperto','micro experto')):
+                    message={'role':'assistant','content':'Solo inicio el entrenamiento de un microexperto cuando el usuario lo pide explícitamente.'}
+                else:
+                    try:
+                        request=internal_calls[-1]['function'].get('arguments',{})
+                        if isinstance(request,str):request=json.loads(request)
+                        if not isinstance(request,dict):raise ValueError('Parámetros de entrenamiento inválidos.')
+                        report=self.micro_controller.train_topic(request.get('topic',''),messages,
+                            request.get('expert'))
+                        if report.get('state')=='insufficient_topic_data':
+                            detail=report['message']
+                        elif report.get('accepted'):
+                            detail=(f"Entrenamiento del microexperto para «{report.get('topic',request.get('topic'))}» "
+                                    f"aceptado y activado. Experto {report['expert']}; versión {report['micro_version']}; "
+                                    f"NLL validación {report['validation_nll_before']:.4f} → {report['validation_nll_after']:.4f}; "
+                                    f"control de regresión {'superado' if report['guardrail_ok'] else 'fallido'}.")
+                            if report.get('chat_data_fact_verified') is False:
+                                detail+=' Se usaron pares del chat autorizados para esta ronda, pero no se consideran hechos verificados.'
+                        else:
+                            detail=(f"El candidato para «{report.get('topic',request.get('topic'))}» fue rechazado; "
+                                    "la extensión activa se conserva porque no mejoró la validación o falló el control de regresión.")
+                    except Exception as exc:
+                        detail=f'No pude completar el entrenamiento del microexperto: {exc}'
+                    message={'role':'assistant','content':detail}
             custom_names={tool['function']['name'] for tool in tools if tool.get('onram_custom')}
             for call in message.get('tool_calls',[]):
                 if call['function']['name'] in custom_names:call['onram_custom']=True
@@ -167,7 +224,11 @@ class NativeEngine:
                                  'tokens_per_second':round(len(generated)/max(elapsed,1e-9),2),
                                  'max_output_tokens':maximum,'input_tokens':count,
                                  'output_limit_source':'client' if requested is not None else 'default',
-                                 'finish_reason':'stop' if completed else 'length'}
+                                 'finish_reason':'stop' if completed else 'length',
+                                 'first_token_seconds':round(first_token-started,3) if first_token is not None else None,
+                                 'prefix_cache_hit':cache_info['hit'],
+                                 'cached_prefix_tokens':cache_info['tokens'],
+                                 'reused_prefix_tokens':cache_info['tokens'] if cache_info['hit'] else 0}
             if live:
                 for item in final_events:emit(item)
             return response
@@ -196,6 +257,15 @@ class NativeEngine:
             cancel.set();future.result()
 
     def train(self,body):
+        self.activity={'state':'training','phase':'validating_examples','started_at':time.time(),
+                       'topic':body.get('topic')}
+        try:
+            return self._train(body)
+        finally:
+            if self.activity.get('state')=='training':
+                self.activity={'state':'idle'}
+
+    def _train(self,body):
         from micro_training import CachedTail,cache_examples,train_cached,sha
         from self_improvement import validate_separation
         if not self.extension_path:raise ValueError('Create a micro-extension before online training')
@@ -204,9 +274,15 @@ class NativeEngine:
             raise ValueError('Provide 1..128 train, validation and guardrail examples each')
         for rows in (train,validation,guardrail):
             for row in rows:
-                if (row.get('verified') is not True or not all(isinstance(row.get(k),str) and
+                approved_chat=(body.get('initiated_by')=='user_request'
+                               and row.get('training_authorized') is True) or (
+                               body.get('initiated_by')=='periodic_schedule'
+                               and body.get('allow_unverified_chat') is True
+                               and row.get('verified') is not True
+                               and row.get('source')=='chl_chat')
+                if ((row.get('verified') is not True and not approved_chat) or not all(isinstance(row.get(k),str) and
                     0<len(row[k].strip())<=8000 for k in ('prompt','completion'))):
-                    raise ValueError('Only explicitly verified prompt/completion examples may train online')
+                    raise ValueError('Use verified CHL examples, or complete chat pairs authorized by an explicit topic-training request')
         validate_separation(train,validation+guardrail)
         expert=int(body.get('expert',0));epochs=int(body.get('epochs',2));max_length=int(body.get('max_length',64))
         if not 1<=epochs<=20 or not 16<=max_length<=256:raise ValueError('Use epochs 1..20 and max_length 16..256')
@@ -232,6 +308,7 @@ class NativeEngine:
             report=train_cached(self.extension_path,directory,candidate,expert=expert,epochs=epochs,
                                 learning_rate=rate,tokens_per_batch=8)
             if report['accepted']:
+                if hasattr(self,'prefix_cache'):self.prefix_cache.clear()
                 updated,new_bank=load_extension(candidate)
                 # All generation is serialized by the same lock: no mixed versions mid-answer.
                 old_state={k:v.detach().clone() for k,v in bank.state_dict().items()}
@@ -244,7 +321,13 @@ class NativeEngine:
                     bank.load_state_dict(old_state,strict=True);self.version=old_version
                     raise
             report['runtime_promoted']=report['accepted'];report['micro_version']=self.version
+            report['topic']=body.get('topic')
+            report['initiated_by']=body.get('initiated_by','api_request')
+            report['data_sources']=body.get('data_sources',[])
+            if {'user_requested_chat','chl_chat'} & set(report['data_sources']):
+                report['chat_data_fact_verified']=False
             self.last_training=report
+            self.activity={'state':'idle'}
             # Cached head is reconstructible; retain metrics/candidate/features, avoid accumulating 0.8 GB per run.
             (directory/'tail.safetensors').unlink(missing_ok=True)
             return report
@@ -269,6 +352,9 @@ def handler_for(engine):
                 if not 0<size<=4_000_000:return self.json({'error':'request body too large or empty'},400)
                 body=json.loads(self.rfile.read(size));path=urlsplit(self.path).path
                 if path=='/onram/train':return self.json(engine.train(body))
+                if path=='/onram/train-topic':
+                    report=engine.micro_controller.train_topic(body.get('topic',''),body.get('messages',[]),body.get('expert'))
+                    return self.json(report,200 if report.get('accepted') else 202)
                 if path=='/v1/messages/count_tokens':
                     messages,tools=messages_for(path,body)
                     return self.json({'input_tokens':len(engine.tokenizer(engine.render(public_messages(messages,summary_enabled(body)),tools))['input_ids'])})

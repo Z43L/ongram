@@ -18,7 +18,8 @@ SOURCES = ('nram_container.py', 'nram_generic.py', 'nram_evolve_generic.py',
            'integrations/chl_bridge.cjs', 'rsi_loop.py', 'onram.py',
            'interaction_learning.py', 'requirements.txt', 'micro_extensions.py',
            'micro_training.py', 'world_memory.py', 'nram_convert.py',
-           'native_runtime.py', 'native_protocol.py', 'inference_settings.py')
+           'native_runtime.py', 'native_protocol.py', 'inference_settings.py', 'prefix_cache.py',
+           'native_placement.py', 'micro_training_control.py')
 
 
 def digest(value: str) -> str:

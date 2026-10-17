@@ -1033,6 +1033,9 @@ def handler_for(app: Onram):
                     return self._json(app.status())
                 if path == "/api/runtime/status" and getattr(app, "backend_kind", "llama.cpp") == "nram":
                     return self._json(app._backend_request("GET", "/onram/status", None))
+                if path == "/api/micro-training/status" and getattr(app, "backend_kind", "llama.cpp") == "nram":
+                    runtime = app._backend_request("GET", "/onram/status", None)
+                    return self._json(runtime.get("micro_training_schedule", {}))
                 if path == "/api/evolve/status":
                     return self._json(app.status()["evolution"])
                 if path == "/api/learning/status":
@@ -1180,6 +1183,10 @@ def handler_for(app: Onram):
                     if getattr(app, "backend_kind", "llama.cpp") != "nram":
                         return self._json({"error": "Direct online training requires --backend nram"}, 400)
                     return self._json(app._backend_request("POST", "/onram/train", body, timeout=3600))
+                if self.path == "/api/micro-training/train-topic":
+                    if getattr(app, "backend_kind", "llama.cpp") != "nram":
+                        return self._json({"error": "Topic micro-training requires --backend nram"}, 400)
+                    return self._json(app._backend_request("POST", "/onram/train-topic", body, timeout=3600))
                 if self.path == "/api/evolve":
                     return self._json(app.begin_evolution(body), 202)
                 if self.path == "/api/learning/feedback":

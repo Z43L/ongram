@@ -61,6 +61,9 @@ class OnlineTrainingTests(unittest.TestCase):
             engine.model=model;engine.tokenizer=Tokenizer();engine.lock=threading.RLock()
             engine.bundle=root/'base.nram';engine.bundle.write_bytes(b'upstream identity')
             engine.extension_path=root/'active.nram';engine.version=0
+            from prefix_cache import PrefixCache
+            engine.prefix_cache=PrefixCache();engine.prefix_cache.snapshot=object()
+            engine.prefix_cache.ids=(1,2);engine.prefix_cache.version=0
             engine.manifest={'base_model':{'weights_sha256':'tiny'}}
             engine.micro_manifest={'model_family':'onram-external-micro-mlp-v1','version':0,
                 'base_weights_sha256':'tiny','parent_bundle':str(engine.bundle),
@@ -73,6 +76,7 @@ class OnlineTrainingTests(unittest.TestCase):
                   'guardrail':[row('regression question')],'epochs':10,'learning_rate':.01}
             with patch('native_runtime.ROOT',root):report=engine.train(body)
             self.assertEqual(engine.version,1 if report['accepted'] else 0)
+            if report['accepted']:self.assertIsNone(engine.prefix_cache.snapshot)
             saved,_=load_bundle(engine.extension_path)
             self.assertEqual(saved['version'],engine.version)
             for name,value in model.named_parameters():

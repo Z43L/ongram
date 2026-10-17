@@ -29,12 +29,14 @@ El repositorio contiene código y documentación. Los pesos, recuerdos, perfiles
 | --- | --- | --- |
 | Inferencia | Checkpoint E2B original en BF16, adaptadores LoRA y microextensiones externas | El modelo base sigue siendo necesario para cada generación. |
 | Servidor persistente | Un motor residente y un hilo de inferencia compartido entre sesiones | Las peticiones de generación se atienden en serie. |
+| Prefijo reutilizable | Caché KV exacta del prefijo común de instrucciones y herramientas | Una entrada, hasta 2.048 tokens y 32 MiB retenidos; puede fallar la coincidencia al cambiar el contexto. |
+| Memoria en Metal | Tabla de embeddings por capa en CPU; cómputo denso en MPS | Sigue requiriendo el checkpoint completo en disco; no cuantiza los pesos. |
 | Streaming | Texto incremental mediante SSE en Chat Completions, Responses y Messages | Los argumentos de herramientas se emiten después de completar su análisis. |
 | Contexto | Hasta 131.072 tokens declarados por el E2B, compartidos entre entrada y salida | La memoria disponible y el coste de procesar el prompt limitan el uso práctico. |
 | Memoria episódica | Recuperación y persistencia CHL en `models/athenea.memory` | Un recuerdo generado por el asistente puede ser incorrecto. |
 | Conocimiento explícito | Hechos, eventos, negaciones, fuentes y conflictos en SQLite | No se ha extraído un mapa semántico completo de los pesos. |
 | Microexpertos | MLP residuales externos con enrutamiento por activaciones | Son extensiones del E2B, no modelos de lenguaje independientes. |
-| Entrenamiento en ejecución | Candidato separado, validación y promoción de una microextensión | Requiere ejemplos revisados y pausa la generación mientras se ejecuta. |
+| Entrenamiento en ejecución | Candidato separado, validación y promoción de una microextensión | Chat autorizado por petición explícita; validación separada; pausa la generación mientras se ejecuta. |
 | Evolución LoRA | Rondas acotadas sobre candidatos con evaluación separada | No demuestra auto-mejora general ni promueve automáticamente el candidato al servidor. |
 | Explicación visible | Una frase de enfoque seguida de la respuesta, transmitida como texto | Es una explicación pública breve; no es una traza de pensamiento interno. |
 | Agentes | Lanzadores para Pi, Claude Code y Codex CLI | Los clientes se instalan por separado; la calidad del uso de herramientas depende del modelo. |
@@ -262,6 +264,11 @@ Si lanzas un agente con `atenhea launch` y el servidor local predeterminado est�
 
 Cerrar un agente no apaga el servidor compartido. Los pesos se vuelven a cargar cuando se reinicia ese servidor o se cambia de modelo, no al abrir cada sesión de Pi.
 
+En la ruta Metal, la tabla de embeddings por capa del E2B (aproximadamente 4,7 GB en BF16) permanece en CPU. Solo se transfieren a MPS las filas consultadas; el cómputo denso sigue en GPU. Ver `parameter_devices: ["cpu", "mps"]` es normal en esta configuración y no significa que haya dos modelos.
+
+El motor retiene una caché KV del prefijo anterior al texto del último usuario. Si los tokens iniciales coinciden exactamente y la versión de pesos sigue vigente, reutiliza una copia de esa caché y procesa el resto del prompt. No recorta ni rebobina una caché deslizante ya consumida. La instantánea se limita a una entrada, 2.048 tokens y 32 MiB; la respuesta actual se genera sobre una copia y no modifica la instantánea retenida. Una promoción de microexpertos invalida la instantánea.
+
+
 El máximo de 131.072 tokens se comparte entre prompt y salida. Por defecto, el motor permite utilizar el espacio restante. Los límites enviados por el cliente también cuentan: `max_output_tokens`, `max_completion_tokens` o `max_tokens`. Alcanzar un límite no obliga al modelo a terminar una frase.
 
 ### Explicación breve durante la inferencia
@@ -368,6 +375,8 @@ curl -N http://127.0.0.1:11434/v1/chat/completions \
 | `GET /api/health` | Estado del proxy, aprendizaje y memoria. |
 | `GET /api/ps`, `GET /api/tags` | Modelo activo y formato nativo. |
 | `POST /api/train` | Entrenamiento supervisado de una microextensión. |
+| `POST /api/micro-training/train-topic` | Entrenamiento temático con el chat enviado y recuerdos CHL verificados. |
+| `GET /api/micro-training/status` | Cadencia y resultado de la última ronda automática. |
 | `GET /api/evolve/status` | Estado del flujo de evolución heredado; no es el estado completo de microentrenamiento. |
 
 Las respuestas SSE usan identificadores estables, eventos de finalización y comentarios de mantenimiento de conexión. Cancelar una generación libera el motor cuando termina el paso en curso. Una operación de GPU atascada puede requerir recuperar el servidor.
@@ -427,7 +436,20 @@ Hay tres operaciones distintas:
 2. **Entrenar microexpertos:** ajustar una extensión pequeña sobre activaciones del E2B congelado.
 3. **Entrenar LoRA:** crear y evaluar candidatos de adaptadores sobre el modelo base.
 
-Conversar, guardar un episodio o abrir Pi **no inicia por sí solo una ronda de entrenamiento**. `base_weights_frozen: true` significa que los pesos base no reciben gradientes; no significa que la inferencia esté detenida.
+Conversar, guardar un episodio o abrir Pi no dispara una ronda con cada petición. El runtime nativo ofrece una herramienta interna `atenhea_train_microexpert` en Pi Agent, Claude Code y Codex CLI. Cuando el usuario pide entrenar sobre un tema concreto, el modelo puede solicitar esa operación durante la inferencia. Combina pares completos del chat actual con recuerdos CHL pertinentes verificados. La autorización explícita permite usar el chat como material de esa ronda, pero no certifica que las respuestas del asistente sean hechos correctos. Por ejemplo: «Entrena un microexperto sobre redes eléctricas usando este chat y la memoria CHL».
+
+Además, el runtime inicia una revisión automática **cada 24 horas**. La ronda general requiere al menos nueve preguntas distintas en CHL, incluidas cinco con recuerdos verificados. Puede usar pares completos de chat no verificados como datos de entrenamiento; la validación y el control de regresión salen exclusivamente de recuerdos verificados. Si faltan datos, registra el motivo y vuelve a comprobarlo en el siguiente intervalo. La ronda selecciona el siguiente experto y aplica la misma validación y control antes de promoverlo.
+
+Configura el intervalo en `models/athenea-micro-training.json`:
+
+```json
+{
+  "enabled": true,
+  "interval_hours": 24
+}
+```
+
+`interval_hours` admite de 1 a 720 horas. `{"enabled": false}` desactiva las rondas automáticas, pero mantiene disponibles las solicitudes desde el agente. Reinicia el runtime después de cambiar este archivo. Consulta `GET /api/micro-training/status` o `micro_training_schedule` en `/api/runtime/status`. `base_weights_frozen: true` significa que los pesos base no reciben gradientes; no significa que la inferencia esté detenida.
 
 Las microextensiones no convierten el E2B completo en un modelo MoE disperso: reducen los parámetros que se entrenan, pero no eliminan el cálculo del modelo base. En Metal se calculan residuos enmascarados de tamaño fijo para evitar sincronizaciones problemáticas.
 
@@ -486,6 +508,8 @@ El servidor calcula características del prefijo congelado, entrena un candidato
 Si acepta el candidato, copia sus tensores a la extensión activa y guarda el archivo lateral de forma atómica. No necesita recargar el checkpoint. Si lo rechaza, mantiene la extensión anterior. Generación y entrenamiento comparten un bloqueo: **no se modifican los pesos a mitad de una respuesta, y Pi espera si hay una ronda activa**.
 
 Consulta `last_training` y `micro_version` en `/api/runtime/status`. El aprendizaje heredado puede figurar como desactivado mientras este endpoint nativo sigue disponible.
+
+El entrenamiento por tema se pide al agente en lenguaje normal. Para clientes HTTP también existe `POST /api/micro-training/train-topic` con `{"topic":"redes eléctricas","messages":[...]}`. La selección combina el tema, los pares completos del historial enviado y los recuerdos CHL verificados. Los pares del chat se registran como autorizados para ese entrenamiento, no como hechos verificados. Si encuentra menos de tres pares distintos, devuelve `insufficient_topic_data` y conserva los pesos.
 
 ### Entrenamiento de microexpertos fuera del servidor
 
@@ -556,8 +580,10 @@ Interpreta los campos así:
 | `pid`, `loaded_at` | Identidad del proceso y momento de carga; se mantienen entre sesiones. |
 | `weights_load_count` | Una carga de pesos durante la vida de ese motor. |
 | `activity.state` | `idle`, preparación o generación. |
-| `activity.phase` | `prefill` al procesar el prompt y `decoding` al producir fragmentos de texto. |
-| `last_inference` | Duración, tokens, límite aplicado y motivo de fin de la última generación registrada. |
+| `activity.phase` | `prefix_cache` al preparar o recuperar la caché, `prefill` para el resto del prompt y `decoding` al producir tokens. |
+| `prefix_cache` | Tokens y bytes retenidos, límites, aciertos y fallos. |
+| `placement` | Colocación de la tabla de embeddings en CPU y ausencia de cuantización. |
+| `last_inference` | Duración, tokens, límite, motivo de fin, acierto de caché y tokens reutilizados. En streaming incluye `first_token_seconds`. |
 | `last_training` | Etapa o resultado del último microentrenamiento de este proceso. |
 | `micro_version` | Versión de la extensión activa. |
 
@@ -592,6 +618,7 @@ Una selección de pruebas del backend nativo, protocolos, memoria y entrenamient
 ```sh
 .venv/bin/python -m unittest \
   test_inference_settings test_agent_native test_native_runtime \
+  test_prefix_cache test_native_placement \
   test_micro_extensions test_world_memory test_nram_low_memory \
   test_trainable_download test_nram_generic test_nram_evolve_generic \
   test_nram_container test_self_training test_self_improvement \
@@ -613,10 +640,12 @@ Los comandos heredados `nram`, `nram-eval`, `nram-sweep`, `nram-memory`, `nram-a
 | `onram_cli.py` | Despacho de comandos y arranque de agentes. |
 | `onram.py` | Proxy público, integración de memoria y API de administración. |
 | `native_runtime.py`, `native_protocol.py` | Inferencia nativa, streaming y adaptación de protocolos. |
+| `prefix_cache.py`, `native_placement.py` | Reutilización exacta del prefijo KV y colocación CPU/MPS del E2B. |
 | `nram_container.py`, `nram_generic.py`, `nram_convert.py` | Contenedor, adaptadores y conversión desde el checkpoint. |
-| `micro_extensions.py`, `micro_training.py` | Microexpertos y entrenamiento sobre características cacheadas. |
+| `micro_extensions.py`, `micro_training.py`, `micro_training_control.py` | Microexpertos, entrenamiento cacheado y solicitudes temáticas o rondas programadas. |
 | `episodic_memory.py`, `integrations/chl_bridge.cjs` | Puente de memoria CHL. |
 | `world_memory.py` | Registros explícitos de hechos y eventos. |
+| `prefix_cache.py`, `native_placement.py` | Caché exacta y colocación de embeddings para reducir el procesamiento repetido y la memoria GPU. |
 | `inference_settings.py` | Preferencia de explicación breve, modificable sin recarga. |
 | `self_improvement.py`, `rsi_loop.py` | Preparación documental y rondas candidatas LoRA. |
 | `docs/athenea-capabilities.json` | Capacidades y límites que se incorporan al autoconocimiento documental. |

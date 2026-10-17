@@ -22,9 +22,10 @@ console.log = (...args) => console.error(...args);
         recalled.candidates.map(c => ({score: c.score,
           payload: c.payload ?? c.entry?.payload,
           metadata: c.metadata ?? c.entry?.metadata}))};
-    } else if (request.action === 'export') {
+    } else if (request.action === 'export' || request.action === 'export_all') {
       result = memory.backup().journal.filter(e => e.type === 'remember' &&
-        e.metadata?.source === 'onram' && e.payload?.verified === true)
+        e.metadata?.source === 'onram' &&
+        (request.action === 'export_all' || e.payload?.verified === true))
         .map(e => e.payload);
     } else throw new Error('Unknown action');
   } finally { await memory.close(); }
