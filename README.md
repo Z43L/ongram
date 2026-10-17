@@ -1,1002 +1,270 @@
-# NRA-M with DistilGPT2
+# Atenhea
 
-This is a CPU-runnable research prototype using **DistilGPT2**, a 82M-parameter
-distilled GPT-2 model. The downloaded checkpoint is pinned to
-`2290a62682d06624634c1f46a6ad5be0f47f38aa`. The project includes a CPU-only
-PyTorch environment, the local Hugging Face checkpoint, a CPU build of
-llama.cpp, and F16/Q4 GGUF exports. [Model card](https://huggingface.co/distilbert/distilgpt2)
+**Inferencia local del Gemma 4 E2B con pesos originales, adaptadores `.nram`, memoria episódica CHL y microexpertos entrenables.**
 
-Weights, `.nram` bundles, GGUF exports, build products, and the Python virtual
-environment are generated locally and are excluded from Git. To bootstrap the
-default DistilGPT2 NRAM model from a clean checkout:
+Atenhea reúne un servidor de inferencia, una memoria persistente y herramientas de entrenamiento supervisado. Su comando principal es `atenhea`. El código conserva nombres históricos como `onram.py`, `onram_cli.py` y los archivos `athenea-*`; todos pertenecen al mismo proyecto.
+
+El backend nativo carga los pesos Safetensors del E2B y les aplica los adaptadores y las microextensiones del proyecto. Sirve respuestas en streaming a Pi Agent, Claude Code, Codex CLI y clientes HTTP. **Esta ruta no convierte el modelo a GGUF ni utiliza llama.cpp.**
+
+El repositorio contiene código y documentación. Los pesos, recuerdos, perfiles locales, resultados de entrenamiento y registros se generan o descargan durante la instalación y quedan fuera de Git.
+
+## Índice
+
+- [Capacidades actuales](#capacidades-actuales)
+- [Cómo funciona](#cómo-funciona)
+- [Requisitos](#requisitos)
+- [Instalación](#instalación)
+- [Arranque y uso diario](#arranque-y-uso-diario)
+- [Pi, Claude Code y Codex CLI](#pi-claude-code-y-codex-cli)
+- [API y streaming](#api-y-streaming)
+- [Memoria episódica y mapa de hechos](#memoria-episódica-y-mapa-de-hechos)
+- [Entrenamiento y evolución](#entrenamiento-y-evolución)
+- [Diagnóstico](#diagnóstico)
+- [Pruebas](#pruebas)
+- [Organización del proyecto](#organización-del-proyecto)
+
+## Capacidades actuales
+
+| Área | Implementación actual | Límite importante |
+| --- | --- | --- |
+| Inferencia | Checkpoint E2B original en BF16, adaptadores LoRA y microextensiones externas | El modelo base sigue siendo necesario para cada generación. |
+| Servidor persistente | Un motor residente y un hilo de inferencia compartido entre sesiones | Las peticiones de generación se atienden en serie. |
+| Streaming | Texto incremental mediante SSE en Chat Completions, Responses y Messages | Los argumentos de herramientas se emiten después de completar su análisis. |
+| Contexto | Hasta 131.072 tokens declarados por el E2B, compartidos entre entrada y salida | La memoria disponible y el coste de procesar el prompt limitan el uso práctico. |
+| Memoria episódica | Recuperación y persistencia CHL en `models/athenea.memory` | Un recuerdo generado por el asistente puede ser incorrecto. |
+| Conocimiento explícito | Hechos, eventos, negaciones, fuentes y conflictos en SQLite | No se ha extraído un mapa semántico completo de los pesos. |
+| Microexpertos | MLP residuales externos con enrutamiento por activaciones | Son extensiones del E2B, no modelos de lenguaje independientes. |
+| Entrenamiento en ejecución | Candidato separado, validación y promoción de una microextensión | Requiere ejemplos revisados y pausa la generación mientras se ejecuta. |
+| Evolución LoRA | Rondas acotadas sobre candidatos con evaluación separada | No demuestra auto-mejora general ni promueve automáticamente el candidato al servidor. |
+| Explicación visible | Una frase de enfoque seguida de la respuesta, transmitida como texto | Es una explicación pública breve; no es una traza de pensamiento interno. |
+| Agentes | Lanzadores para Pi, Claude Code y Codex CLI | Los clientes se instalan por separado; la calidad del uso de herramientas depende del modelo. |
+
+La ruta nativa implementada acepta **texto y herramientas**. No ofrece entrada de imágenes, audio o vídeo, aunque el checkpoint de origen incluya componentes multimodales.
+
+## Cómo funciona
+
+```text
+Pi / Claude Code / Codex CLI / cliente HTTP
+                    │
+                    ▼
+          Atenhea — 127.0.0.1:11434
+            │ recupera contexto CHL
+            │ añade hechos relevantes
+            ▼
+        Motor nativo — 127.0.0.1:11436
+            │
+            ├── pesos originales Safetensors del E2B
+            ├── adaptadores de athenea-e2b.nram
+            └── microexpertos de athenea-e2b.extensions.nram
+                    │
+                    ▼
+          respuesta incremental en SSE
+                    │
+                    ▼
+       episodio CHL si la respuesta terminó
+```
+
+El archivo `.nram` principal contiene un manifiesto, tensores de adaptadores, referencias al checkpoint, metadatos y una instantánea documental de código seleccionado. **No contiene todos los pesos base del E2B y no es un ejecutable autónomo.** El checkpoint debe seguir disponible en su ruta local.
+
+La instantánea de código sirve como documentación para preparar análisis y entrenamiento. El sistema no ejecuta código extraído de ese documento.
+
+Cada agente reutiliza el servidor y los pesos ya cargados. Abrir otra sesión de Pi no crea otro modelo. El lanzador verifica el backend, el alias y el `.nram`; el arranque se serializa y el servidor reserva su puerto antes de cargar el checkpoint.
+
+## Requisitos
+
+La ruta principal se ha probado en **macOS con Apple Silicon, Python 3.12 y PyTorch MPS**.
+
+Necesitas:
+
+- Git y acceso a Internet para la descarga inicial.
+- Python 3.12 con `venv` y `pip`.
+- Node.js accesible como `node`, o una ruta explícita en `ONRAM_NODE`, para CHL.
+- Un compilador C para construir el lanzador `build/atenhea`. En macOS puede utilizarse el de Command Line Tools.
+- Espacio para un checkpoint de aproximadamente 10 GB, dependencias, cachés y candidatos. Deja margen adicional; el entrenamiento puede crear archivos grandes.
+- Memoria suficiente para los pesos y las activaciones. Un equipo de 16 GB puede sufrir presión de memoria e intercambio a disco, especialmente con prompts largos.
+
+El motor selecciona MPS cuando está disponible y CPU en caso contrario. La selección automática no elige CUDA. Linux/CPU y otras configuraciones no tienen la misma validación práctica que la ruta macOS/MPS. Windows no está soportado directamente por los componentes que utilizan `fcntl` y operaciones POSIX.
+
+## Instalación
+
+Ejecuta los pasos desde una carpeta donde quieras conservar el proyecto y sus modelos.
+
+### 1. Clonar y preparar Python
 
 ```sh
-python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt
-.venv/bin/python download_model.py
-./setup_onram.sh
-.venv/bin/python nram_convert.py --model models/distilgpt2 \
-  --output models/distilgpt2-nra-qa.nram
-.venv/bin/python nram_export_generic.py --bundle models/distilgpt2-nra-qa.nram \
-  --output-prefix models/onram-bootstrap
-ln -s onram-bootstrap-Q4_K_M.gguf models/onram-current.gguf
-./atenhea --bundle models/distilgpt2-nra-qa.nram
+git clone https://github.com/Z43L/4T3NH34.git
+cd 4T3NH34
+
+python3.12 -m venv .venv
+.venv/bin/python -m pip install --upgrade pip
+.venv/bin/python -m pip install -r requirements.txt
 ```
 
-## Unified Onram command
-
-The adapted `onram` command is the single entry point for the upstream
-utilities and the workspace's Gemma NRA-M tools. Build its small native
-launcher once, then use subcommands instead of invoking utility scripts
-directly:
+El lanzador utiliza primero `ONRAM_PYTHON`, si está definido, y después el Python de `.venv`. Para fijarlo explícitamente:
 
 ```sh
-./build_onram.sh
-./build/atenhea --help
-./build/atenhea list
-./build/atenhea test
-./build/atenhea convert --help
-./build/atenhea nram info models/Gemma4-E2B-NRA.nram
-./build/atenhea nram-eval --help
-./build/atenhea launch --help
+export ONRAM_PYTHON="$PWD/.venv/bin/python"
 ```
 
-List downloaded models with `./atenhea list` (alias: `./atenhea models`). This
-scans `models/` recursively without starting the server, showing format, size
-in GiB and absolute path. Split GGUF files are grouped into one model; incomplete
-downloads are excluded. Use `--json` for structured output or `--dir /path/to/models`
-to inspect another directory. Local GGUF, NRAM and Hugging Face weight directories
-are supported.
-
-In one terminal, start the Onram API with a coding model:
+### 2. Instalar CHL
 
 ```sh
-./atenhea serve --model /path/to/coder-model.gguf --model-name local-coder
-```
-
-In another terminal, launch an installed agent through its native protocol
-adapter (choose one):
-
-```sh
-./atenhea launch claude
-./atenhea launch codex --model local-coder:latest
-./atenhea launch pi -- --print "Review this repository"
-```
-
-`launch` targets `http://127.0.0.1:11434` by default. It checks `/v1/models`
-and selects the first advertised model; if the server is down and the local
-Llama 3.2 model and bundle are present, it starts Onram with interaction
-learning enabled. `--model` or `ONRAM_MODEL` overrides model selection;
-`--base-url` or `ONRAM_BASE_URL` selects another Onram instance, which must
-already be running. `ONRAM_API_KEY` is forwarded as the local provider
-credential. Put agent-specific arguments after `--`. For Pi, the command adds
-or updates the `onram` provider in `PI_CODING_AGENT_DIR/models.json` (default
-`~/.pi/agent/models.json`) and preserves the other providers.
-
-For compatibility, `./atenhea --model ...` and `./atenhea --bundle ...` still
-start the HTTP server; explicit `./atenhea serve ...` does the same. The launcher
-can select the Python environment through `ONRAM_PYTHON`, otherwise it uses
-this checkout's `.venv`, the parent workspace's `.venv-gemma4`, or `python3`.
-
-The native launcher is a command dispatcher, not a self-contained model
-runtime. Python dependencies, checkpoint files, and the `llama-server`
-executable remain separate runtime requirements. The upstream v2 LoRA bundles
-also remain a distinct format from the workspace's Gemma `.nram` v1 packages;
-the `nram*` commands operate on v1 and the upstream training/export commands
-operate on v2.
-
-For this workspace, requirements use Transformers 5.19.0 so the generic path
-can load the locally tested Gemma 4 architecture. A v1 Gemma package can serve
-as the frozen base for a v2 LoRA experiment:
-
-```sh
-./atenhea convert --model ../../models/Gemma4-E2B-NRA.nram \
-  --dtype bfloat16 --rank 4 --output models/gemma4-adapter.nram
-./atenhea infer-generic "Answer briefly: what is a recurrent neural state?" \
-  --bundle models/gemma4-adapter.nram --local-files-only
-```
-
-This conversion loads the full base model and saves only a LoRA adapter in v2.
-It reads the v1 Safetensors tensor bank plus its tokenizer/config assets, but
-does not apply v1 routes, associative memory, or output deltas. It preserves
-Gemma's Transformer execution; it is not an architectural conversion to NRA-2.
-
-The clone snapshot does not include an upstream `LICENSE` file. It is kept in
-the workspace for internal research; clarify upstream licensing before
-redistributing the clone or derived binaries.
-
-The initial adapter is zero initialized, so the bootstrap GGUF is equivalent
-to the base checkpoint. Use `/api/evolve` with verified training examples to
-start changing it; Onram serves the current GGUF while validating candidates.
-
-## What the evolving path does
-
-`nram_evolve.py` freezes the original DistilGPT2 weights and attaches rank-4
-LoRA projections to the last block's attention and MLP projections. It trains
-only those 27,648 adapter parameters. A candidate is committed atomically to a
-single `.nram` file only if:
-
-1. Held-out completion-token negative log-likelihood improves.
-2. Mean rank of the expected first answer token does not get worse.
-3. Optional general-language guardrail loss stays within the configured drift
-   limit (5% by default).
-
-The `.nram` v2 container stores a JSON manifest, graph instructions, provenance,
-version journal, checksummed Safetensors adapter tensors, and validation
-metrics. Failed candidates leave the previously accepted file unchanged.
-
-Train or continue the included NRA-M Q&A experiment:
-
-```sh
-.venv/bin/python nram_evolve.py \
-  --train data/nra_qa_train.jsonl \
-  --validation data/nra_qa_validation.jsonl \
-  --guardrail data/general_guardrail.jsonl \
-  --epochs 8 --learning-rate 0.0001
-```
-
-Use the adapter with Transformers:
-
-```sh
-.venv/bin/python nram_infer.py $'Explain the ENCODE operation in NRA-M.\nAnswer:' \
-  --max-new-tokens 24 --min-new-tokens 6
-```
-
-## First real result
-
-The accepted `models/distilgpt2-nra-qa.nram` bundle is version 3. On the small
-included held-out set, its completion NLL fell from **5.660 to 3.111** and
-general guardrail NLL from **3.604 to 2.410**. The rank of the expected first
-answer token moved from mean rank **6.0 to 1.67**, with top-1 hits improving
-from **0/6 to 2/6**. These measurements are limited to this tiny synthetic NRA
-Q&A task; they do not show a broad reasoning or language-quality improvement.
-
-Greedy generations can still produce incorrect or generic continuations even
-when token-level validation improves. Treat this as a working parameter-update
-and rollback experiment, not as a reliable assistant model. The evaluator now
-tracks first-token ranking to catch candidates that improve average loss while
-making the next answer token worse.
-
-## GGUF output
-
-Yes, after a candidate passes, merge the adapter into a fresh copy of the base
-weights and export that checkpoint as a new GGUF. The current evolved version
-has these files:
-
-- `models/onram-nram-v3-f16.gguf` — merged higher-precision checkpoint.
-- `models/onram-nram-v3-Q4_K_M.gguf` — quantized copy for smaller local
-  inference.
-- `models/distilgpt2-nra-qa.nram` — adapter, graph, provenance, and evolution
-  journal used to reproduce the merged checkpoint.
-
-The `.gguf` is the inference checkpoint. The `.nram` holds the change process
-and reversible state. GGUF is a model storage format, not an implementation of
-the mutation runtime. See the [GGUF format specification](https://github.com/ggml-org/ggml/blob/master/docs/gguf.md).
-
-To merge and export a later accepted `.nram` version:
-
-```sh
-./export_evolved.sh models/distilgpt2-nra-qa.nram distilgpt2-nra-next
-```
-
-Each training run starts a fresh AdamW optimizer; the accepted adapter and
-version history persist, while optimizer moments are not stored yet.
-
-The local llama.cpp checkout is pinned to commit
-`1b70350c92563449576bcbbf552994b1d1ed847d`. Its converter needed a one-line
-local patch to omit GPT-2's stored causal-mask buffers; `export_gguf.sh` applies
-that patch when setting up a fresh checkout.
-
-## Verification
-
-```sh
-.venv/bin/python verify_local.py
-.venv/bin/python verify_evolved.py
-.venv/bin/python -m unittest -v
-```
-
-`verify_evolved.py` checks that the adapter and merged checkpoint produce
-matching logits, the held-out metrics have not regressed, and llama.cpp loads
-and generates from the evolved F16 GGUF. The core unit tests cover transaction
-rejection, checksums, `.nram` tensor persistence, and that a zero-initialized
-LoRA adapter leaves the original model output unchanged.
-
-## Onram alpha: local inference plus supervised evolution
-
-`onram.py` is a small Ollama-shaped HTTP service around `llama-server`. It
-serves a local GGUF through `/api/generate` and `/api/chat`, and includes
-`/api/tags`, `/api/show`, `/api/ps`, and `/api/version`. It streams generation
-results in newline-delimited JSON. It does not include Ollama's model
-registry/pull, Modelfile build, embeddings, cloud, or platform packaging
-features. Coding-agent API compatibility is described below.
-
-The local llama.cpp checkout can build its server without downloading UI
-assets:
-
-```sh
-.venv/bin/cmake -S third_party/llama.cpp -B build \
-  -DLLAMA_BUILD_SERVER=ON -DLLAMA_CURL=OFF
-.venv/bin/cmake --build build --target llama-server -j2
-./atenhea
-```
-
-The default HTTP port is `11434`, so existing clients that call Ollama's
-`/api/generate` or `/api/chat` can point at Onram. Example:
-
-```sh
-curl http://127.0.0.1:11434/api/generate -d '{
-  "model":"distilgpt2-nram:latest",
-  "prompt":"ENCODE means",
-  "stream":false,
-  "options":{"num_predict":32,"temperature":0.2}
-}'
-```
-
-An accepted training run can be started while the current GGUF keeps serving:
-
-```sh
-curl http://127.0.0.1:11434/api/evolve -d '{
-  "train":"nra_qa_train.jsonl",
-  "validation":"nra_qa_validation.jsonl",
-  "guardrail":"general_guardrail.jsonl",
-  "epochs":2,
-  "learning_rate":0.0005
-}'
-curl http://127.0.0.1:11434/api/evolve/status
-```
-
-The evolution endpoint only accepts the project datasets under `data/`. The
-trainer validates the candidate before committing `.nram`; after acceptance,
-Onram exports a fresh GGUF and restarts the inference worker on that file. This
-short reload can interrupt requests. A local `models/onram-current.gguf`
-pointer records the active version across restarts. Inference prompts are not
-training data: the model does not silently learn from user conversations.
-
-The original evolution endpoint supports the pinned DistilGPT2 experiment. The
-generic Hugging Face causal-LM conversion and evolution workflow is documented
-below. Passing a different llama.cpp-compatible GGUF with `--model` changes
-inference only; an evolvable NRAM bundle must be created from trainable source
-weights. Binding to a non-local address requires `--api-key` or `ONRAM_API_KEY`.
-
-## Coding-agent API proxy
-
-Onram also exposes the local model through the API formats used by Claude Code,
-Codex, and Pi. Requests and streaming responses are relayed to llama.cpp without
-rewriting their JSON or SSE events, preserving tool declarations and tool
-results. The supported routes are:
-
-- `POST /v1/messages` and `/v1/messages/count_tokens` for Anthropic Messages.
-- `POST /v1/responses` and `/v1/responses/input_tokens` for OpenAI Responses.
-- `POST /v1/chat/completions`, `/v1/chat/completions/control`, and
-  `/v1/chat/completions/input_tokens` for OpenAI Chat Completions.
-- `GET /v1/models` returns the active Onram model alias.
-
-Start the service with the GGUF and a stable ID for the coding agents:
-
-```sh
-./atenhea --model /path/to/coder-model.gguf --model-name local-coder
-```
-
-The model ID reported by `/v1/models` is then `local-coder:latest`. A bearer
-token or Anthropic `x-api-key` is accepted when `--api-key`/`ONRAM_API_KEY` is
-set. Without a key the server only binds to localhost by default.
-By default llama.cpp uses the GGUF's context setting; pass `--ctx-size N` to
-override it (larger contexts use more memory).
-
-### Claude Code
-
-Claude Code uses Anthropic Messages and supports a custom base URL. For a
-key-protected Onram instance:
-
-```sh
-export ANTHROPIC_BASE_URL=http://127.0.0.1:11434
-export ANTHROPIC_API_KEY="$ONRAM_API_KEY"
-export ANTHROPIC_MODEL=local-coder:latest
-claude
-```
-
-For a localhost-only instance without `--api-key`, set a dummy
-`ANTHROPIC_API_KEY=local-onram`; Onram ignores it when authentication is
-disabled. Anthropic's `ANTHROPIC_AUTH_TOKEN` can be used instead and is sent as
-a bearer token.
-
-### OpenAI Codex
-
-Codex uses the Responses API. Add a custom provider to `~/.codex/config.toml`:
-
-```toml
-model = "local-coder:latest"
-model_provider = "onram"
-
-[model_providers.onram]
-name = "Onram local"
-base_url = "http://127.0.0.1:11434/v1"
-wire_api = "responses"
-requires_openai_auth = false
-supports_websockets = false
-
-[model_providers.onram.capabilities]
-remote_compaction = "unsupported"
-```
-
-For a key-protected server, add `env_key = "ONRAM_API_KEY"` to that provider
-table and set the variable before starting Codex. Codex's HTTP Responses API works through this
-proxy; WebSocket transport and remote compaction are not provided. Codex's
-Responses API configuration is documented in the [Codex config
-reference](https://developers.openai.com/codex/config-reference/).
-
-### Pi
-
-Add a provider to `~/.pi/agent/models.json`:
-
-```json
-{
-  "$schema": "https://pi.dev/schemas/models.schema.json",
-  "providers": {
-    "onram": {
-      "baseUrl": "http://127.0.0.1:11434/v1",
-      "api": "openai-completions",
-      "apiKey": "${ONRAM_API_KEY}",
-      "models": [{ "id": "local-coder:latest" }]
-    }
-  }
-}
-```
-
-Pi requires an API key entry to make the custom model available. Use
-`"apiKey": "local-onram"` for an unauthenticated local server, or use
-`${ONRAM_API_KEY}` when Onram authentication is enabled. Pi's provider format
-is documented in [Choose a model](https://pi.dev/docs/latest/models).
-
-Claude Code's endpoint variables are documented in [LLM gateway
-configuration](https://code.claude.com/docs/en/llm-gateway).
-
-These routes provide protocol compatibility, not a guarantee that every model
-can act as a coding agent. Tool use depends on the GGUF's chat template and
-training; llama.cpp documents that tool calling requires a compatible Jinja
-template. Codex web search, remote compaction, and WebSocket transport are not
-implemented by this local proxy. Check the model's context limit before using
-large coding-agent conversations.
-
-## Generic conversion for Hugging Face causal LMs
-
-The generic CLI adds an architecture-aware path for dense causal language
-models that load with `AutoModelForCausalLM`. It recognizes common attention
-and MLP projection names, supports `nn.Linear` storage and GPT-2 `Conv1D`
-storage, and defaults to LoRA on the last transformer block. It records the
-exact module paths and tensor layouts in the `.nram` manifest. If auto-detection
-does not fit a model, specify projection suffixes with `--targets`.
-
-```sh
-python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt
-.venv/bin/python download_model.py
-./setup_onram.sh
-
-.venv/bin/python nram_convert.py \
-  --model /path/to/huggingface-checkpoint \
-  --output models/my-model.nram \
-  --rank 8 --last-k-blocks 2
-
-.venv/bin/python nram_evolve_generic.py \
-  --bundle models/my-model.nram \
-  --train data/nra_qa_train.jsonl \
-  --validation data/nra_qa_validation.jsonl \
-  --guardrail data/general_guardrail.jsonl \
-  --epochs 2 --local-files-only
-
-.venv/bin/python nram_export_generic.py \
-  --bundle models/my-model.nram \
-  --output-prefix models/my-model-evolved
-```
-
-The `.nram` bundle stores the trainable adapter and the base checkpoint's
-source/revision/fingerprint; it does not duplicate the full base weights. Use a
-Hugging Face checkpoint or repository with trainable weights and a tokenizer.
-Inference-only GGUF files cannot be converted into trainable weights by this
-path. GGUF export also depends on llama.cpp having a converter for the model's
-architecture. Architectures with custom projections may need explicit target
-names, and custom model code must be opted into with `--trust-remote-code`.
-
-Generic evolution automatically selects CUDA, then Apple MPS, then CPU. CPU
-training uses up to 10 PyTorch threads and batches four examples to reduce
-per-example model calls; override with `--device`, `--threads`, and
-`--batch-size`. The Onram status endpoint exposes the current stage, batch
-count, device, and elapsed seconds while training.
-
-After each run, the `.nram` manifest stores an `inference_attribution` profile.
-It replays captured prompt/answer pairs through the trainable Transformers
-model, records adapter-input/output magnitudes and per-layer LoRA gradient
-strength, and uses the strongest 60% of layers as the next run's update targets
-once a prior profile exists. Validation and the general guardrail still decide
-whether changed adapter weights are accepted. This is gradient-based attribution
-of captured responses; llama.cpp's GGUF runtime does not identify a unique set
-of causal weights for generated text. A rejected candidate saves the diagnostic
-profile and validation report while retaining the previous adapter tensors.
-
-For an instrumented Transformers generation, the `nram-debug` command runs the
-prompt through the bundle and records per-layer hidden-state RMS/top channels
-plus each LoRA adapter's contribution magnitude. It prints the answer but
-stores only prompt/answer hashes in the JSON report. Add
-`--gradient-attribution` to run a slower teacher-forced gradient pass over the
-generated answer and rank adapter targets for investigation:
-
-```sh
-./build/atenhea nram-debug "Explain this function and its edge cases." \
-  --bundle models/llama3.2-1b-instruct.nram \
-  --local-files-only --gradient-attribution \
-  --output results/inference-debug.json
-```
-
-This is a Transformers replay using the `.nram` bundle, not a trace from the
-live quantized `llama-server` GGUF process. Activation magnitudes and
-gradient-based adapter scores are diagnostic signals, not proof that a specific
-base-model weight caused an answer. The debugger never changes weights; a
-candidate still needs separate validation and promotion gates. The additional
-gradient pass can use substantially more memory.
-
-Normal agent requests through Onram also use the patched GGUF runtime debugger
-by default. Build Onram's local `llama-server` with `./setup_onram.sh`, then
-inspect its state at `GET /api/debug/status`. It writes one compact JSONL entry
-per request under the model's ignored learning directory, with prompt/answer
-hashes and per-layer final-residual RMS/top-channel summaries. Raw text and full
-activation vectors are not written. Disable runtime tracing with
-`--no-inference-debug` or `ONRAM_INFERENCE_DEBUG=0`.
-
-The GGUF trace comes from the actual quantized server request. It exposes
-activation magnitudes, not gradients through quantized weights; use the
-Transformers `nram-debug --gradient-attribution` replay for adapter-gradient
-salience. Neither score alone proves that a weight caused an answer, and neither
-automatically mutates the model.
-
-To keep an arbitrary converted model in Onram's inference loop, first export
-the initial (zero-adapter) checkpoint and link its GGUF to a model-specific
-current pointer, then start Onram with that bundle. Its `/api/evolve` endpoint
-detects the generic bundle, trains/validates it, and reloads a new GGUF after an
-accepted candidate:
-
-```sh
-.venv/bin/python nram_export_generic.py \
-  --bundle models/my-model.nram \
-  --output-prefix models/my-model-bootstrap
-ln -s my-model-bootstrap-Q4_K_M.gguf models/my-model-current.gguf
-./atenhea --model models/my-model-current.gguf \
-  --bundle models/my-model.nram --model-name my-model --port 11434
-```
-
-The generic server mode still uses the bundled example datasets by default;
-replace them with curated examples and separate held-out validation/guardrail
-sets before relying on training results.
-
-## Learning from local API interactions
-
-The server enables local interaction learning by default, including when
-launched through `./build/atenhea serve` or `./atenhea serve`. To disable it for
-one run, pass `--no-auto-learn` or set `ONRAM_AUTO_LEARN=0`. Start the configured
-Llama bundle with:
-
-```sh
-./start-onram-learning.sh
-```
-
-The same launcher enables the per-layer GGUF trace. Recent reports are stored
-in `models/llama3.2-1b-instruct-learning/inference-traces.jsonl`; the temporary
-callback stream is cleared after each request. The server uses one parallel
-slot so each trace remains associated with the request that produced it.
-`./build/atenhea runtime-setup` applies the llama.cpp callback patch from
-`patches/llama-cpp-inference-trace.patch` before rebuilding the server. The
-runtime GGUF is downloaded separately because model files are local artifacts:
-
-```sh
-hf download bartowski/Llama-3.2-1B-Instruct-GGUF \
-  Llama-3.2-1B-Instruct-Q4_K_M.gguf \
-  --local-dir models/llama3.2-1b-instruct-runtime-gguf
-ln -s llama3.2-1b-instruct-runtime-gguf/Llama-3.2-1B-Instruct-Q4_K_M.gguf \
-  models/llama3.2-1b-instruct-current.gguf
-```
-
-The trace stores prompt/response hashes and per-layer residual activation
-summaries; it does not persist prompt or response text or full activations.
-
-### Feed answer quality back into selective training
-
-When Onram is running, list recent traces and copy the `trace_id` for the
-answer you want to rate. Then submit `good` to keep that generated pair as a
-positive example, or `bad` with a corrected answer to train on your correction:
-
-```sh
-curl -s http://127.0.0.1:11534/api/debug/traces
-curl -s -X POST http://127.0.0.1:11534/api/learning/feedback \
-  -H 'Content-Type: application/json' \
-  -d '{"trace_id":"<trace-id>","rating":"bad","corrected_completion":"Respuesta corregida por ti."}'
-```
-
-Use `"rating":"good"` to approve a response; `corrected_completion` is only
-accepted with a bad rating. A bad answer without a correction is excluded from
-the training split. The correction replaces that answer as the supervised
-target and is stored in the feedback ledger because it is text explicitly
-provided by you. Feedback is matched to the actual GGUF inference using its
-trace ID and text hashes; the trace ledger itself continues to store hashes,
-not conversation text.
-
-Three distinct bad traces with your corrections are required before their GGUF activation
-profiles can guide initial layer selection. The profile compares per-layer
-residual RMS on corrected bad answers with approved good answers when those are
-available. It is a selection hint, not a causal explanation: LoRA gradients,
-held-out validation, personal validation, and general guardrails still gate
-the candidate. Automatic evolution also requires the configured interaction
-batch plus at least 10 training and 3 validation examples. Check
-`GET /api/learning/status` and `GET /api/evolve/status` to see whether feedback
-has accumulated or an evolution run has started.
-
-Claude Code, Codex, Pi, or another client must send inference requests to this
-Onram instance for those turns to be captured. The listener is local-only at
-`http://127.0.0.1:11534`; the current setup uses `/v1/messages` (Anthropic),
-`/v1/responses` (OpenAI Responses), `/v1/chat/completions`, and `/api/chat` or
-`/api/generate`. The current Codex conversation is not captured unless Codex is
-configured to use this provider.
-
-On this computer, the clients are configured as opt-in profiles:
-
-```sh
-./claude-local.sh
-codex --profile onram
-pi --provider onram --model llama3.2-1b-instruct:latest
-```
-
-For another OpenAI-compatible client, set its base URL to
-`http://127.0.0.1:11534/v1`, its API key to `local-onram`, and its model to
-`llama3.2-1b-instruct:latest`. Start Onram first with `./start-onram-learning.sh`.
-The existing Codex default model and Pi's Ollama provider remain available.
-
-Llama 3.2 1B supports up to 128K tokens. The launchers leave llama.cpp's
-`--ctx-size` at `0`, which loads the GGUF's native maximum (131072 tokens for
-this model); Pi and the Onram Codex profile advertise the same limit. Long
-prompts use more unified memory, so actual usable context can still depend on
-available memory.
-
-Onram stores unique, completed text pairs in the ignored file
-`models/llama3.2-1b-instruct-learning/interactions.jsonl`. It omits system
-prompts and tool payloads, skips tool-call/partial responses, and keeps only
-recent user text plus the final assistant text. It also records explicitly
-stated names and preferences in the ignored `personal_facts.json` file and
-builds dedicated personal question/answer examples for evolution. Every 24 new
-conversation pairs, it trains a candidate and validates both generated fact
-recall and general behavior. A new or changed personal fact gets 50 focused
-epochs; later micro-updates use 8 epochs. Personal examples use the model's
-chat template and include held-out paraphrases. A personal-fact candidate is
-promoted only when held-out generation answers at least 75% of those questions
-with the expected fact, personal loss improves, and general validation and the
-guardrail stay within limits.
-Accepted candidates reload automatically. An interrupted attempt is resumed
-when the server starts again. Check progress and the number of
-captured personal facts at `GET /api/learning/status`; `/api/evolve/status`
-shows the current candidate run. This is still local self-distillation from
-the model's own final answers, not a signal that the user approved each answer.
-Inspect the captured files and periodically review or remove entries that
-should not be retained. Training uses the BF16 Hugging Face base and can put
-memory pressure on a 16 GB machine.
-
-## Strata backend on Apple Silicon
-
-Install Strata, its private Python environment, Metal engine and model from Onram:
-
-```sh
-./atenhea strata-setup --no-start
-./start-strata.sh
-```
-
-The installer copies the existing `../strata` checkout (override with `--source`);
-it never clones it or modifies that installation. If no local source exists,
-it downloads the GitHub source archive automatically; `--archive-url` can pin
-a specific commit archive. No separate Strata installation is required. Runtime code and build tools
-live in `third_party/strata`, and weights/packs live in `models/strata`.
-Existing downloaded weights and partial downloads are copied independently,
-using APFS clones where supported. Later runs resume downloads. Source provenance is recorded in `third_party/strata/onram-source.json` (revision when available, or archive SHA-256).
-Strata's own installer installs dependencies, compiles Metal, downloads missing
-model files and prepares its expert streaming layout. Internet access and the
-Apple Command Line Tools are required. The default is Q2_0, text only, 2048
-context tokens. Setup needs roughly 100 GB available for weights and preparation.
-16 GB Macs are experimental: successful setup does not establish usable inference.
-
-`strata-setup` starts Onram after installation unless `--no-start` is supplied.
-Installation output can be saved with `./atenhea strata-setup --no-start > strata-install.log 2>&1`.
-To use an already prepared installation explicitly:
-
-```sh
-./atenhea serve --backend strata \
-  --strata-dir /absolute/path/to/strata \
-  --strata-config /absolute/path/to/strata/strata-q2_0.json
-```
-
-Onram starts Strata on localhost port 11436 and exposes its usual port 11434.
-OpenAI Chat Completions/Responses and Anthropic requests are relayed to Strata;
-Ollama generate/chat requests are translated to Chat Completions, including SSE
-streaming and chat roles. `/api/generate` treats its prompt as a user message.
-Model size metadata is reported as unknown (zero), not as the default GPT-2 size.
-Strata controls model context through its generated JSON; Onram's `--ctx-size`
-only applies to llama.cpp. Override the interpreter with `--strata-python`.
-Automatic evolution and llama.cpp activation traces are disabled for Strata;
-manual evolution returns an explicit unsupported error. The existing llama.cpp
-backend remains the default. Installation does not change client provider settings.
-
-`./atenhea launch pi` also starts the installed Strata backend automatically when
-Onram is down; Q2_0 is preferred if multiple configurations exist. No Llama 3.2
-files are required in that case. On Macs with at most 20 GiB of RAM the installer
-disables the large prompt GEMM buffers and uses decode windows for prefill.
-This trades prompt speed for lower memory use. Avoid running a second model
-server alongside it on a 16 GB Mac.
-
-## Gemma 4 26B-A4B with native maximum context
-
-```sh
-./atenhea gemma-setup --no-start
-./start-gemma.sh
-# in another terminal:
-./atenhea launch pi
-```
-
-This installs the latest stable llama.cpp release as a separate Metal runtime
-under `third_party/llama-current`, builds `build/llama-current/bin/llama-server`,
-and downloads Unsloth's UD-IQ3_S GGUF (~11.3 GB), pinned to a model revision and
-verified by SHA-256. The setup is resumable. Existing research runtime patches
-remain separate. CMake must be installed (the Strata environment's CMake can
-also be reused).
-
-The generated `models/onram-launch.json` selects Gemma for agent autostart.
-Its context is explicitly 262144 (the native maximum), with a single sequence,
-Q4_0 KV cache, Flash Attention and small prompt batches. Model weights use mmap
-and may be paged from SSD. Automatic fitting may adjust GPU offload, but the
-minimum fit context is also 262144. No wired-memory system settings are changed.
-Pi receives a 262144-token context window when launching this profile.
-
-On a 16 GB Mac, configured capacity does not prove that a fully occupied 262K
-conversation fits or performs acceptably. Paging and context processing can be
-slow. Stop other model servers before starting Gemma. Auto learning and runtime
-activation tracing are disabled for this unpatched inference runtime.
-
-## Apple Silicon SSD / Metal performance work
-
-The optional Metal IO expert-reader patch and a reproducible native benchmark
-are described in [docs/apple-ssd-performance.md](docs/apple-ssd-performance.md).
-`./atenhea ssd-bench` measures disk-to-shared-memory reads plus a checksum kernel,
-without downloading models. `tools/bench_strata_ssd.py` compares real generations
-and logs memory pressure / swap. The original pread reader stays the default;
-Metal IO is selected explicitly in the Strata config. Gemma downloads are not
-resumed by these tools.
-
-## CHL episodic memory for direct `.nram` inference
-
-The `infer` and `infer-generic` commands use `models/athenea.memory` by default
-(resolved relative to this project, regardless of the working directory).
-Override it with `--chl-memory PATH`; the memory utility also defaults to this
-archive. Before
-inference they retrieve up to four CHL episodes (at most 4,000 characters of
-serialized episode data); after successful generation they persist the original
-prompt and answer as an **unverified** episode. Reuse the same path across calls.
-The original `.nram` is not modified. The HTTP server and `onram launch` also use this archive by default.
-
-Install the actual upstream engine (the checkout is ignored by Git):
-
-```sh
+mkdir -p third_party
 git clone https://github.com/Z43L/CHL-episodic-agent-memory.git third_party/chl
 git -C third_party/chl checkout 3d5d7700384b55c2c29c84d8a7becb91eaf210ef
-# Optional native acceleration; requires Node headers and clang++:
+node --version
+```
+
+El puente utiliza `NativeCHL` directamente. Para esta integración no hace falta arrancar un segundo servidor CHL.
+
+Si Node.js no está en el PATH, indica su ejecutable:
+
+```sh
+export ONRAM_NODE=/ruta/a/node
+```
+
+La aceleración nativa de CHL es opcional:
+
+```sh
 node third_party/chl/scripts/build-native.js
 ```
 
-Node.js must be available on PATH, or set `ONRAM_NODE` to its executable.
-`ONRAM_CHL_REPO` can point to another checkout. No cloud model or API key is
-needed. CHL uses its JavaScript fallback when the native addon is unavailable;
-`recall` reports the active engine. The bridge locks the archive across processes
-and waits for CHL hydration before each operation. Use one archive per user and
-project; archives store conversation text. Keep archives under ignored `models/`.
+Si el complemento nativo no está disponible, CHL puede utilizar su implementación JavaScript. Comprueba el puente antes de descargar el modelo:
 
 ```sh
-./atenhea infer-generic '¿Qué decidimos sobre el almacenamiento?' \
-  --bundle models/my-model.nram --chl-memory models/my-model.memory
-
-# Add a reviewed question/answer, or a corrected answer, as verified evidence:
-python3 episodic_memory.py --memory models/my-model.memory remember \
-  '¿Dónde guardamos los pedidos?' 'En PostgreSQL.' --verified
-python3 episodic_memory.py --memory models/my-model.memory recall 'pedidos'
-python3 episodic_memory.py --memory models/my-model.memory export \
-  --output data/chl-reviewed.jsonl
+.venv/bin/python episodic_memory.py recall 'comprobación de instalación'
 ```
 
-Export includes only explicitly verified episodes, deduplicated with provenance
-hashes, in the `prompt`/`completion` format consumed by `nram_evolve_generic.py`.
-Unreviewed generations remain retrievable historical data and are labelled as
-potentially incorrect in the context. Retrieved content is labelled as data,
-with the current request taking priority; this is a prompt instruction, not a
-security boundary. The character budget is not a tokenizer context-window check.
+El resultado informa del motor utilizado y puede devolver una lista vacía de recuerdos en una instalación nueva.
 
-Memory retrieval changes the input context; it does not train model weights.
-To evolve weights, use reviewed exports as training input in the existing
-`onram evolve` workflow, with a separate, independent validation dataset and its
-candidate acceptance checks. This bridge does not automatically validate its own
-answers, schedule training, or promote a new model. Improvements in recall or model
-quality must be measured; persistence alone does not establish an improvement.
-
-Validate the bridge without loading model weights:
+### 3. Construir el comando Atenhea
 
 ```sh
-python3 -m unittest test_episodic_memory -v
+./build_onram.sh
+./atenhea --help
+./build/atenhea --version
 ```
 
+Se genera `build/atenhea`. Los nombres anteriores `onram` y `build/onram-cli` se mantienen como entradas de compatibilidad.
 
-### Shared Athenea memory for coding agents
-
-Start agents through the existing launch commands:
+Para instalar el comando en tu PATH:
 
 ```sh
-./atenhea launch pi
-./atenhea launch claude
-./atenhea launch codex
+mkdir -p "$HOME/.local/bin"
+ln -sfn "$PWD/build/atenhea" "$HOME/.local/bin/atenhea"
+export PATH="$HOME/.local/bin:$PATH"
 ```
 
-All three use the Onram server, which now defaults to
-`models/athenea.memory`. It retrieves episodes for Anthropic Messages, OpenAI
-Chat Completions, OpenAI Responses, and Ollama chat/generate requests, including
-streaming responses. Only completed text answers are stored; tool calls and
-partial answers are omitted by the existing extractor. Capture works even with
-`--no-auto-learn` and with the Strata backend. The agent tool protocol and
-original request text are preserved; injected context is not written back as a
-new user episode. CHL errors appear in the server log and at
-`/api/health` under `episodic_memory.last_error`; requests continue without memory
-when retrieval fails.
-
-Override the server archive with `onram serve --chl-memory PATH`.
-Restart an already running Onram server to load these changes. Agents started
-against other providers do not use this local memory.
-
-## Athenea: documented and evaluated self-improvement
-
-`docs/athenea-capabilities.json` describes the system's identity, available
-mechanisms, known limitations, treatment of user facts and world knowledge,
-and criteria for accepting improvements. It deliberately separates documented
-mechanisms from capabilities demonstrated by benchmarks.
+Añade esta línea al archivo de configuración de tu shell, por ejemplo `~/.zshrc`, para conservarla en nuevas terminales:
 
 ```sh
-onram rsi-prepare --ingest-docs
-onram rsi-prepare --analyze
+export PATH="$HOME/.local/bin:$PATH"
 ```
 
-Preparation writes `models/athenea-rsi/self-knowledge.json` (full allowlisted
-source snapshots with SHA-256 hashes), `analysis-prompt.txt`, and, when analysis
-completes, `unverified-proposal.json`. Documentation ingestion writes eight
-verified, typed `knowledge` records to `models/athenea.memory`, tagged by area
-(`self`, `user`, `world`, `code`). These are verified statements about the
-implementation, not evidence of model accuracy. Model proposals remain
-unverified and are never interpreted as executable code or optimizer settings.
-`--analyze` calls the local model through Onram and requires a complete text
-response; a truncated response is not accepted as a completed analysis.
-
-The generic LoRA trainer now defaults to embedding this documentation and the
-allowlisted source code in the `.nram` manifest under `self_knowledge`.
-This is inert documentation; it is never imported or executed from the bundle.
-It adds a bounded number of grounded documentation examples to training and
-at most 32 verified CHL replay examples. More recent verified corrections take
-priority for the same question. Unverified episodes and model-generated
-proposals are excluded. Exact normalized evaluation questions are excluded from
-replay; overlapping original train/evaluation prompts fail before training.
-Semantic overlap still requires dataset review.
-
-Before optimization, the trainer records shapes, parameter counts and numerical
-RMS for adapter tensors and their frozen base projections. It records target
-selection, baseline validation and a completed local-model analysis proposal.
-The proposal is advisory: the existing gradient/activation selector controls
-which LoRA modules are trainable. There is no claim that activation magnitudes
-explain the causal meaning of individual weights. Inspecting projections does
-not inspect every parameter of the full model.
-
-After training, existing validation and regression gates decide acceptance.
-Non-finite loss, gradient norms, metrics or inspected tensors prevent accepting
-weights. Rejected runs retain original tensors; diagnostic metadata describes
-the candidate and records its rejection. Analysis files are written beside the
-bundle in `<bundle-stem>-analysis/`. The effective augmented training dataset
-has its own hash in `self_knowledge.training_context`.
-
-To select an area, use `onram evolve --specialization self|user|world|code`.
-This filters supplemental documentation and CHL replay by area; the explicitly
-provided training dataset remains the primary task data. Verified memories can
-be tagged with `python3 episodic_memory.py remember QUESTION ANSWER --verified
---area code`. `--no-self-analysis` runs offline with numerical preflight only;
-`--no-self-knowledge` disables this entire optional layer. Neither changes the
-existing model architecture.
-
-A bounded recursive candidate workflow is available:
+Comprueba la instalación:
 
 ```sh
-onram rsi-train --bundle models/athenea.nram \
-  --train data/specialized-train.jsonl \
-  --validation data/independent-validation.jsonl \
-  --guardrail data/general_guardrail.jsonl \
-  --specialization code --rounds 2
+command -v atenhea
+atenhea --version
 ```
 
-The named bundle and datasets must actually exist. This command requires the
-Python training dependencies and a trainable generic NRAM v2 bundle with its
-Transformers base checkpoint, plus a running local Onram model for the analysis
-step. A GGUF alone cannot satisfy these requirements. It copies each candidate
-to a new run directory, continues only from accepted candidates, stops on the
-first rejection, and caps work at three rounds. The original bundle and running
-GGUF remain unchanged. The final candidate still needs a separate untouched
-benchmark before deployment: repeatedly consulting one validation set can
-adaptively overfit it. This implements bounded evaluated improvement, not a
-claim of unrestricted RSI or an established intelligence gain.
+Conserva el directorio del proyecto: el binario localiza los módulos Python junto al checkout. Si lo mueves, actualiza el enlace y las rutas de tus perfiles.
+
+### 4. Descargar el E2B y crear el `.nram`
 
 ```sh
-python3 -m unittest test_self_improvement test_episodic_memory test_onram_memory -v
+./atenhea e2b-trainable-setup
 ```
 
-### Trainable Athenea E2B checkpoint and NRAM
+Este comando descarga `google/gemma-4-E2B-it` en `models/gemma4-e2b-trainable`, fija la revisión en los metadatos locales, reanuda los rangos pendientes y verifica los pesos con los hashes publicados. Después crea `models/athenea-e2b.nram` con adaptadores inicializados a cero mediante conversión de bajo consumo de memoria.
 
-`onram e2b-trainable-setup` downloads only `google/gemma-4-E2B-it` into
-`models/gemma4-e2b-trainable/`, pins its Hub commit, resumes completed byte ranges,
-and verifies each LFS SHA-256. It then creates `models/athenea-e2b.nram` using
-`onram convert --low-memory --dtype bfloat16`. An existing bundle is preserved.
+Una segunda ejecución conserva un `.nram` existente. **No crea por sí sola los microexpertos ni el perfil de arranque del siguiente paso.**
 
-The low-memory converter builds the architecture on PyTorch's meta device,
-creates only CPU LoRA tensors, and compares each selected projection shape with
-the downloaded Safetensors headers. It never materializes the full base in RAM.
-The v2 `.nram` contains adapters, source identity and fingerprint, code/document
-snapshots and the `athenea.memory` path. The base weights remain in their local
-checkpoint directory; keep that directory alongside the bundle. Zero-initialized
-LoRA residuals preserve the original model until training is performed.
+Si la descarga devuelve `401` o `403`, comprueba el acceso y las condiciones del checkpoint en Hugging Face. El descargador incluido usa HTTP directo; no añade automáticamente un token de Hugging Face a sus solicitudes.
 
-This provides trainable source files, not proof that this Mac has enough free
-memory for a complete training or inference pass. The full multimodal E2B
-checkpoint needs more memory than its existing quantized GGUF. Stop other model
-servers or use a machine with enough memory before loading it for training.
+### 5. Crear las microextensiones
+
+Solo en una instalación nueva:
 
 ```sh
-onram e2b-trainable-setup
-# Equivalent conversion after download, with an explicit alternative output:
-onram convert --model models/gemma4-e2b-trainable \
-  --output models/athenea-e2b-copy.nram --dtype bfloat16 --low-memory
+./atenhea micro create \
+  --bundle models/athenea-e2b.nram \
+  --output models/athenea-e2b.extensions.nram \
+  --experts 3 --rank 8 --layer 34
 ```
 
-## Direct Onram inference and online micro-training (E2B)
+La operación enlaza la extensión desde el manifiesto del `.nram` principal. Si el archivo de extensión ya existe, el comando se niega a sobrescribirlo para preservar sus pesos entrenados.
 
-The Athenea launch profile now uses `--backend nram`: Onram loads the downloaded
-BF16 Transformers weights and `models/athenea-e2b.nram` directly. It keeps the
-model resident on Apple MPS when available and attaches
-`models/athenea-e2b.extensions.nram`. No GGUF conversion, merge or llama.cpp
-process is involved in this backend. Start it with `onram`, `onram serve`,
-`./start-athenea.sh`, or `onram launch pi|claude|codex`. Explicit backend/model
-arguments still override the saved launch profile.
+En el E2B con dimensión oculta 1.536, esta configuración crea tres expertos de 24.576 parámetros cada uno y un enrutador de 4.608 parámetros. Entrenar un experto y el enrutador modifica **29.184 parámetros**. Sus salidas residuales iniciales son cero: una instalación nueva todavía no contiene expertos entrenados.
 
-The base checkpoint stays frozen. Three external residual micro-MLPs are seeded
-from actual rows of the final E2B MLP gate projection. Each expert has 24,576
-parameters; the activation router adds 4,608, so one expert plus the router has
-29,184 trainable parameters. Initial residual outputs are zero. These extensions
-need the E2B's activations; they are not standalone language models. Their
-channel partitions have no established factual or semantic meaning.
+### 6. Crear el perfil nativo predeterminado
 
-For offline preparation and candidate training:
+Los perfiles están bajo `models/` y no se distribuyen en Git. Crea uno con rutas absolutas de tu propia instalación:
 
 ```sh
-onram micro-train cache --bundle models/athenea-e2b.nram \
-  --train data/reviewed-train.jsonl --validation data/heldout.jsonl \
-  --output models/athenea-cache --max-length 64
-onram micro-train train --extension models/athenea-e2b.extensions.nram \
-  --cache models/athenea-cache --output models/micro-candidate.nram --expert 0
+.venv/bin/python - <<'PY'
+import json
+from pathlib import Path
+
+root = Path.cwd().resolve()
+profile = {
+    "name": "athenea-e2b:latest",
+    "backend": "nram",
+    "context_size": 131072,
+    "args": [
+        "--backend", "nram",
+        "--model", str(root / "models/gemma4-e2b-trainable"),
+        "--bundle", str(root / "models/athenea-e2b.nram"),
+        "--model-name", "athenea-e2b",
+        "--ctx-size", "131072",
+        "--chl-memory", str(root / "models/athenea.memory"),
+        "--no-auto-learn",
+        "--no-inference-debug",
+    ],
+}
+(root / "models/onram-launch.json").write_text(
+    json.dumps(profile, indent=2) + "\n", encoding="utf-8"
+)
+PY
+
+./atenhea reasoning on
 ```
 
-Caching runs the frozen E2B prefix once. Subsequent training uses cached
-features, the exact final-layer tail (including E2B's per-layer inputs), and one
-small expert. Updates use 2,048 sampled vocabulary candidates by default;
-validation normalizes over all 262,144 vocabulary tokens using bounded FP32
-projection chunks. This is not a full-model speed benchmark. Tests compare
-cached-tail logits with a complete small Gemma forward pass. Rebuild the cache
-when upstream base or LoRA weights change.
+Este perfil mantiene la memoria CHL activa y desactiva el antiguo entrenamiento automático del backend GGUF. El entrenamiento de microexpertos se solicita por separado mediante la API nativa.
 
-The running backend also exposes `POST /api/train`. Send JSON arrays `train`,
-`validation` and `guardrail`, each with 1..128 examples containing `prompt`,
-`completion` and explicit `verified: true`. Optional settings include `expert`
-(default 0), `epochs` (1..20), `max_length` (16..256), and `learning_rate`
-(positive, at most 0.01). The endpoint serializes with generation, captures the
-current frozen prefix, trains a separate candidate, and accepts only improved
-held-out NLL with at most 2% guardrail NLL drift. It leaves the active extension
-unchanged on rejection. Acceptance updates its in-memory tensors and atomically
-saves the sidecar, without restarting the model. `GET /api/runtime/status`
-reports the current version and last result.
+### 7. Comprobar y arrancar
+
+```sh
+./atenhea serve
+```
+
+En otra terminal:
 
 ```sh
 curl http://127.0.0.1:11434/api/runtime/status
-curl http://127.0.0.1:11434/api/train -H 'Content-Type: application/json' \
-  --data-binary @models/athenea-online/smoke-request.json
 ```
 
-Do not blindly repeat the smoke dataset to claim further improvement. The smoke
-run used two documentation examples, two differently worded validation examples,
-and two regression examples. A version accepted by this small test is not proof
-of general model improvement. Unreviewed chat generations are collected in CHL
-but are not automatically treated as training truth. Full-model updates remain
-separate from these micro-updates.
+Comprueba que aparecen `loaded: true`, `backend: "nram"`, el `.nram` esperado y `device: "mps"` si tu equipo utiliza Metal. Una instalación nueva suele mostrar `micro_version: 0`; la versión aumenta al aceptar entrenamiento.
 
-The direct backend supports text and tool calls through Chat Completions,
-Responses and Anthropic Messages. Its SSE implementation transfers visible text incrementally during generation,
-with stable response IDs and completion/usage events for each protocol. Structured
-tool calls are parsed before their arguments are emitted. The native default output
-budget uses the remaining model context (E2B: 131072 tokens shared by input and
-output); explicit client limits
-(`max_output_tokens`, `max_completion_tokens`, `max_tokens`) take precedence.
-Runtime status includes the applied limit, its source and the finish reason. Disconnects cancel
-generation; weight updates wait until the active generation has stopped. Multimodal inputs are rejected explicitly. Agent protocol
-formatting is tested; successful model tool use still depends on model quality.
+## Arranque y uso diario
 
-External experts can grow without changing the active model:
+Con el perfil instalado, cualquiera de estas entradas inicia la ruta nativa:
 
 ```sh
-onram micro grow --extension models/athenea-e2b.extensions.nram \
-  --output models/athenea-e2b-grown.extensions.nram
+atenhea
+atenhea serve
+./start-athenea.sh
 ```
 
-Growth preserves existing outputs and leaves the new branch inactive. It must
-be separately trained and evaluated before being enabled. Candidate creation
-does not automatically replace the active bank.
+El servidor se ejecuta en primer plano. Puedes dejarlo abierto en una terminal y abrir los agentes en otras. Para detenerlo, utiliza `Ctrl+C` en la terminal del servidor.
 
-### Explicit world memory
+Si lanzas un agente con `atenhea launch` y el servidor local predeterminado está apagado, el lanzador intenta arrancarlo en segundo plano con el perfil guardado. El registro queda en `onram-server.log`; el del motor, en `onram-backend.log`.
 
-`models/athenea.world.sqlite` stores subject/relation/object edges, positive or
-negative polarity, facts or dated events, provenance, and explicit verification.
-Opposite verified claims remain visible as unresolved contradictions and are
-excluded from supervised export until resolved. This symbolic graph is separate
-from the micro-expert weight map; no claim is made that a fact has been located
-in a specific neuron. Relevant verified records augment CHL context within the
-same character budget.
+Cerrar un agente no apaga el servidor compartido. Los pesos se vuelven a cargar cuando se reinicia ese servidor o se cambia de modelo, no al abrir cada sesión de Pi.
 
-```sh
-onram world-memory add --subject Atlas --relation usa --object PostgreSQL \
-  --source 'decisión revisada del usuario' --verified
-onram world-memory recall 'Atlas almacenamiento'
-onram world-memory export --output data/reviewed-world.jsonl
-```
+El máximo de 131.072 tokens se comparte entre prompt y salida. Por defecto, el motor permite utilizar el espacio restante. Los límites enviados por el cliente también cuentan: `max_output_tokens`, `max_completion_tokens` o `max_tokens`. Alcanzar un límite no obliga al modelo a terminar una frase.
 
-Generated or inferred statements should remain unverified until supported by
-an appropriate source. Exported world records still need an independent
-validation dataset before training.
-
-
-The native Atenhea agent launchers share one local server and checkpoint:
-
-```sh
-atenhea launch pi
-atenhea launch claude
-atenhea launch codex
-```
-
-Before launching against the default local address, Atenhea verifies the active
-backend is `nram` and that the model alias and bundle match `models/onram-launch.json`.
-A different backend is rejected. The server loads the original E2B safetensors,
-the NRAM adapters and the external micro-extension bank, and retrieves CHL context
-from `models/athenea.memory`. No GGUF conversion is involved in this path.
-
-The Codex launcher uses `models/atenhea-agents/codex` as its local `CODEX_HOME`,
-with the model catalog in `docs/atenhea-codex-models.json`, so unrelated cloud
-plugins and MCP schemas do not consume the E2B context. Standard coding tools
-remain available. Hosted web search is disabled for this local profile; the
-native runtime does not implement that provider-side service. These scoped
-settings follow the [official OpenAI configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference).
-Claude Code must be installed separately; its launcher uses the same local server
-through the Anthropic Messages protocol. Invoking an agent directly outside
-`atenhea launch` uses that agent's own configuration.
-
-Agent launches reuse the resident native server and its loaded weights; they do
-not create a model per Pi session. Startup is serialized with
-`build/atenhea-startup.lock`, and the public port is reserved before a new server
-loads any checkpoint. A persistent inference worker serves successive requests.
-`/api/runtime/status` reports the worker PID, load timestamp, current activity and
-one weight load per worker lifetime. SSE keep-alive comments also cover waits
-between visible text fragments. Closing Pi does not stop the shared model server.
-
-The Metal micro-extension path uses fixed-size masked residuals instead of
-per-expert GPU scalar reads and variable-size boolean gathers. Its output is
-tested against the original sparse routing; trained extension weights are unchanged.
-
-Brief public explanations can be toggled live:
+### Explicación breve durante la inferencia
 
 ```sh
 atenhea reasoning on
@@ -1004,16 +272,361 @@ atenhea reasoning off
 atenhea reasoning status
 ```
 
-The current default is on, persisted in `models/athenea-inference.json` and read
-for each request. For explanatory questions, the model is instructed to write
-`Enfoque:` with one short sentence about its method, then `Respuesta:` with the
-answer. Both are ordinary visible text and stream through Pi, Messages and
-Responses clients. This is a brief public explanation, not a raw hidden thinking
-trace; private parser fields remain excluded. Exact-output requests, structured
-formats and tool calls are instructed to omit the preamble. Adherence depends on
-the model. Requests can override it with `show_reasoning_summary: false` or
-`reasoning: {"summary": null}`. No second generation pass is added.
+Con el modo activado, las preguntas explicativas reciben una instrucción para empezar con una frase `Enfoque:` y continuar con `Respuesta:`. Ambos forman parte del texto visible y se transmiten en streaming. Se indica al modelo que omita el preámbulo en respuestas literales, formatos estrictos y llamadas de herramientas; el cumplimiento depende del modelo.
 
-Native runtime status also reports the `prefill`/`decoding` phase and the current
-visible-fragment counter while a request runs. Changing the explanation preference
-does not restart the worker or reload weights.
+La preferencia se guarda en `models/athenea-inference.json` y se consulta en cada petición. Cambiarla no recarga los pesos ni añade una segunda generación. Puede anularse por petición con `show_reasoning_summary: false` o `reasoning: {"summary": null}`.
+
+## Pi, Claude Code y Codex CLI
+
+Instala cada cliente por separado y comprueba que su ejecutable esté en el PATH:
+
+```sh
+command -v pi
+command -v claude
+command -v codex
+```
+
+Después utiliza los lanzadores de Atenhea:
+
+```sh
+atenhea launch pi
+atenhea launch claude
+atenhea launch codex
+```
+
+| Cliente | Conexión configurada por el lanzador |
+| --- | --- |
+| Pi Agent | Proveedor `onram`, alias `athenea-e2b:latest`, API Chat Completions. |
+| Claude Code | `ANTHROPIC_BASE_URL` local y modelo E2B mediante Anthropic Messages. |
+| Codex CLI | Proveedor local `onram`, API Responses y catálogo propio del E2B. |
+
+Los tres comparten el motor, las microextensiones activas y la memoria CHL. El lanzador rechaza un servidor local cuyo backend, alias o `.nram` no coincidan con el perfil nativo.
+
+Para pasar opciones al cliente, sepáralas con `--`:
+
+```sh
+atenhea launch pi -- --print 'Explica brevemente qué hace este proyecto.'
+atenhea launch claude -- --print 'Responde únicamente: listo'
+atenhea launch codex -- exec --skip-git-repo-check --ephemeral \
+  --sandbox read-only 'Responde únicamente: listo. No uses herramientas.'
+```
+
+El cliente de Claude debe estar instalado para probar su ejecución real. La compatibilidad del endpoint Messages no sustituye esa instalación.
+
+### Configuración particular de Codex
+
+El lanzador nativo utiliza `models/atenhea-agents/codex` como `CODEX_HOME` y el catálogo `docs/atenhea-codex-models.json`. Así evita heredar el volumen de herramientas y ajustes de una configuración cloud que podría superar el contexto del E2B.
+
+Este perfil desactiva la búsqueda web alojada del proveedor, que el motor local no implementa. Conserva las herramientas de código estándar. Las opciones se documentan en la [referencia de configuración de Codex](https://learn.chatgpt.com/docs/config-file/config-reference).
+
+### Abrir Pi directamente con este modelo
+
+`atenhea launch pi` configura el proveedor y lo selecciona explícitamente. Abrir `pi`, `claude` o `codex` directamente utiliza la configuración propia de cada programa y no garantiza que el servidor se arranque automáticamente.
+
+Si quieres seleccionar Atenhea por defecto al abrir Pi directamente, añade estas claves a `~/.pi/agent/settings.json`, conservando sus demás ajustes:
+
+```json
+{
+  "defaultProvider": "onram",
+  "defaultModel": "athenea-e2b:latest"
+}
+```
+
+Primero ejecuta `atenhea launch pi` para crear el proveedor y deja el servidor disponible. El uso recomendado para gestionar tanto el modelo como el arranque sigue siendo `atenhea launch pi`.
+
+## API y streaming
+
+El proxy público escucha por defecto en `http://127.0.0.1:11434`. El puerto `11436` es del motor interno; utiliza el público para conservar la recuperación y captura CHL.
+
+### Generación en streaming
+
+```sh
+curl -N http://127.0.0.1:11434/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "athenea-e2b:latest",
+    "messages": [{"role": "user", "content": "Explica qué es la memoria episódica."}],
+    "stream": true,
+    "max_tokens": 512,
+    "temperature": 0.2
+  }'
+```
+
+`curl -N` evita el almacenamiento intermedio del cliente. Para recibir un único JSON al terminar, utiliza `"stream": false`.
+
+### Endpoints principales
+
+| Método y ruta | Función |
+| --- | --- |
+| `GET /v1/models` | Alias del modelo servido. |
+| `POST /v1/chat/completions` | Conversación y herramientas con formato Chat Completions. |
+| `POST /v1/responses` | Formato Responses, historial por `previous_response_id` y herramientas. |
+| `POST /v1/messages` | Formato Anthropic Messages. |
+| `POST /v1/messages/count_tokens` | Recuento con la plantilla del modelo. |
+| `POST /api/chat`, `POST /api/generate` | Adaptación de peticiones con formato Ollama. |
+| `GET /api/runtime/status` | PID, carga, actividad, contexto, versión y última inferencia o entrenamiento. |
+| `GET /api/health` | Estado del proxy, aprendizaje y memoria. |
+| `GET /api/ps`, `GET /api/tags` | Modelo activo y formato nativo. |
+| `POST /api/train` | Entrenamiento supervisado de una microextensión. |
+| `GET /api/evolve/status` | Estado del flujo de evolución heredado; no es el estado completo de microentrenamiento. |
+
+Las respuestas SSE usan identificadores estables, eventos de finalización y comentarios de mantenimiento de conexión. Cancelar una generación libera el motor cuando termina el paso en curso. Una operación de GPU atascada puede requerir recuperar el servidor.
+
+El historial de Responses mantenido por el motor es limitado y está en memoria. Un reinicio lo pierde; CHL es un almacenamiento separado y no sustituye un identificador `previous_response_id` desconocido.
+
+El servidor se limita a loopback por defecto. Si configuras `--api-key`, los clientes deben enviar esa credencial; el lanzador la toma de `ONRAM_API_KEY`. No se necesita una clave de OpenAI para ejecutar el E2B local.
+
+## Memoria episódica y mapa de hechos
+
+### Memoria CHL
+
+La ruta predeterminada es `models/athenea.memory`, resuelta desde el proyecto. El puente recupera hasta cuatro episodios y utiliza un presupuesto de contexto de aproximadamente 4.000 caracteres, compartido con hechos relevantes del mapa explícito. Este presupuesto no equivale a tokens ni garantiza que una conversación completa quepa en el contexto.
+
+Los turnos de texto completados se guardan como episodios **no verificados**, incluso con el antiguo aprendizaje automático desactivado. Las llamadas de herramientas, errores y respuestas parciales no se convierten en pares de entrenamiento por esta captura.
+
+Consulta recuerdos o incorpora una respuesta que hayas revisado:
+
+```sh
+.venv/bin/python episodic_memory.py recall 'ruta de almacenamiento'
+
+.venv/bin/python episodic_memory.py remember \
+  '¿Qué comando inicia el servidor local?' 'atenhea serve' --verified
+
+.venv/bin/python episodic_memory.py export \
+  --output models/chl-reviewed.jsonl
+```
+
+La exportación de entrenamiento incluye solo episodios marcados explícitamente como verificados, deduplicados y con metadatos de procedencia. Un recuerdo recuperable no se convierte automáticamente en verdad ni en un ajuste de pesos.
+
+Los errores CHL durante recuperación aparecen en el registro y en el estado de memoria del proxy. La inicialización del servidor requiere un checkout CHL válido y Node.js disponible.
+
+### Hechos, eventos y negaciones
+
+`world_memory.py` mantiene una base SQLite en `models/athenea.world.sqlite` con sujeto, relación, objeto, polaridad, fuente, fecha opcional y estado de verificación. Señala conflictos y permite retirar registros. Los hechos verificados relevantes pueden añadirse al contexto; la exportación de entrenamiento omite grupos con contradicciones pendientes.
+
+```sh
+atenhea world-memory init
+
+atenhea world-memory add \
+  --subject Atenhea --relation backend --object nram \
+  --source 'perfil local revisado' --verified
+
+atenhea world-memory recall Atenhea
+atenhea world-memory export --output models/world-reviewed.jsonl
+```
+
+Utiliza `atenhea world-memory add --help` para registrar eventos, fechas o polaridad negativa. El mapa es explícito: no identifica automáticamente dónde está cada hecho dentro de los pesos del E2B.
+
+Los archivos de memoria contienen información de las conversaciones. Conserva las copias de seguridad fuera de repositorios públicos y utiliza archivos separados si necesitas aislar usuarios o proyectos.
+
+## Entrenamiento y evolución
+
+Hay tres operaciones distintas:
+
+1. **Recordar:** recuperar episodios o hechos para mejorar el contexto de la petición actual.
+2. **Entrenar microexpertos:** ajustar una extensión pequeña sobre activaciones del E2B congelado.
+3. **Entrenar LoRA:** crear y evaluar candidatos de adaptadores sobre el modelo base.
+
+Conversar, guardar un episodio o abrir Pi **no inicia por sí solo una ronda de entrenamiento**. `base_weights_frozen: true` significa que los pesos base no reciben gradientes; no significa que la inferencia esté detenida.
+
+Las microextensiones no convierten el E2B completo en un modelo MoE disperso: reducen los parámetros que se entrenan, pero no eliminan el cálculo del modelo base. En Metal se calculan residuos enmascarados de tamaño fijo para evitar sincronizaciones problemáticas.
+
+### Microentrenamiento con el servidor cargado
+
+Prepara un archivo JSON con tres conjuntos independientes, revisados y adecuados para el objetivo. Este ejemplo muestra el formato; no es un benchmark ni un conjunto suficiente para afirmar una mejora general:
+
+```json
+{
+  "train": [
+    {
+      "prompt": "¿Qué comando inicia el servidor de Atenhea?",
+      "completion": "atenhea serve",
+      "verified": true
+    }
+  ],
+  "validation": [
+    {
+      "prompt": "¿En qué formato están los pesos base de la ruta nativa?",
+      "completion": "Safetensors.",
+      "verified": true
+    }
+  ],
+  "guardrail": [
+    {
+      "prompt": "¿Cuánto es dos más dos?",
+      "completion": "4.",
+      "verified": true
+    }
+  ],
+  "expert": 0,
+  "epochs": 2,
+  "max_length": 64,
+  "learning_rate": 0.001
+}
+```
+
+Guárdalo, con tus propios ejemplos, en `models/train-request.json` y envíalo:
+
+```sh
+curl http://127.0.0.1:11434/api/train \
+  -H 'Content-Type: application/json' \
+  --data-binary @models/train-request.json
+```
+
+Condiciones actuales:
+
+- Cada conjunto debe contener entre 1 y 128 ejemplos con `prompt`, `completion` y `verified: true`.
+- Los prompts de entrenamiento no deben repetirse en evaluación. La comprobación textual no detecta toda posible filtración semántica.
+- `epochs`: 1–20; `max_length`: 16–256; `learning_rate`: mayor que cero y como máximo 0,01.
+- Se entrenan el experto seleccionado y el enrutador; los demás expertos y el checkpoint base se conservan.
+- Se acepta un candidato si mejora la pérdida de validación y la pérdida de guardrail no empeora más del 2 %.
+
+El servidor calcula características del prefijo congelado, entrena un candidato separado y evalúa su salida. El objetivo de entrenamiento usa por defecto 2.048 candidatos de vocabulario; la validación calcula la normalización sobre el vocabulario completo en bloques FP32.
+
+Si acepta el candidato, copia sus tensores a la extensión activa y guarda el archivo lateral de forma atómica. No necesita recargar el checkpoint. Si lo rechaza, mantiene la extensión anterior. Generación y entrenamiento comparten un bloqueo: **no se modifican los pesos a mitad de una respuesta, y Pi espera si hay una ronda activa**.
+
+Consulta `last_training` y `micro_version` en `/api/runtime/status`. El aprendizaje heredado puede figurar como desactivado mientras este endpoint nativo sigue disponible.
+
+### Entrenamiento de microexpertos fuera del servidor
+
+Para preparar una caché y entrenar un candidato por CLI:
+
+```sh
+atenhea micro-train cache \
+  --bundle models/athenea-e2b.nram \
+  --train models/reviewed-train.jsonl \
+  --validation models/heldout.jsonl \
+  --output models/athenea-cache --max-length 64
+
+atenhea micro-train train \
+  --extension models/athenea-e2b.extensions.nram \
+  --cache models/athenea-cache \
+  --output models/micro-candidate.nram --expert 0
+```
+
+Los archivos JSONL contienen un objeto `prompt`/`completion` por línea. El comando de caché carga su propia instancia del modelo: no reutiliza el servidor HTTP residente. En un dispositivo ajustado de memoria, utiliza preferentemente `/api/train` o detén el servidor antes de preparar la caché fuera de él.
+
+Reconstruye la caché si cambian los pesos base o los adaptadores LoRA. El candidato generado por CLI no sustituye por sí solo la extensión del servidor.
+
+Puedes crear un banco candidato con un experto adicional:
+
+```sh
+atenhea micro grow \
+  --extension models/athenea-e2b.extensions.nram \
+  --output models/athenea-expanded.extensions.nram
+```
+
+El banco activo no cambia y el experto nuevo queda desactivado. Esta operación no crea conocimiento útil sin entrenamiento y evaluación.
+
+### Autoconocimiento documental y rondas LoRA
+
+```sh
+atenhea rsi-prepare --ingest-docs
+
+atenhea rsi-train \
+  --bundle models/athenea-e2b.nram \
+  --train models/reviewed-train.jsonl \
+  --validation models/heldout.jsonl \
+  --guardrail models/regression.jsonl \
+  --specialization code --rounds 1
+```
+
+`rsi-prepare` reúne capacidades documentadas y una selección de fuentes del repositorio. `--analyze` puede pedir al modelo local una propuesta, que se conserva como no verificada. `rsi-train` ejecuta de una a tres rondas sobre copias candidatas y se detiene si una ronda no cumple sus condiciones.
+
+Este flujo utiliza su propio proceso de entrenamiento y no promueve automáticamente el resultado al servidor. Conserva el original y exige evaluación posterior. Reutilizar repetidamente el mismo conjunto de validación tampoco sustituye un benchmark final intacto.
+
+El proyecto implementa herramientas acotadas para preparar y evaluar mejoras. **No demuestra RSI autónomo, edición semántica fiable de los pesos ni mejora general continua.**
+
+## Diagnóstico
+
+### Pi parece congelado
+
+```sh
+curl http://127.0.0.1:11434/api/runtime/status
+curl http://127.0.0.1:11434/api/health
+tail -n 40 onram-backend.log
+tail -n 40 onram-server.log
+```
+
+Interpreta los campos así:
+
+| Campo | Qué indica |
+| --- | --- |
+| `loaded` | El motor terminó de cargar. |
+| `pid`, `loaded_at` | Identidad del proceso y momento de carga; se mantienen entre sesiones. |
+| `weights_load_count` | Una carga de pesos durante la vida de ese motor. |
+| `activity.state` | `idle`, preparación o generación. |
+| `activity.phase` | `prefill` al procesar el prompt y `decoding` al producir fragmentos de texto. |
+| `last_inference` | Duración, tokens, límite aplicado y motivo de fin de la última generación registrada. |
+| `last_training` | Etapa o resultado del último microentrenamiento de este proceso. |
+| `micro_version` | Versión de la extensión activa. |
+
+Un prompt largo puede tardar antes del primer fragmento. El máximo de contexto no es una promesa de latencia. Los pesos mapeados también pueden verse afectados por presión de memoria del sistema.
+
+La ruta Metal de los microexpertos evita lecturas escalares de GPU y selecciones de tamaño variable por experto; utiliza residuos enmascarados equivalentes a la ruta dispersa. Esto reduce un punto de bloqueo observado, pero no garantiza que cualquier fallo del controlador GPU sea recuperable desde el proceso.
+
+Si cancelaste una petición, espera a que termine su paso activo. Si el proceso no avanza, cancela la petición del agente y reinicia el servidor desde su terminal. No elimines los archivos de pesos o memoria para resolver un bloqueo de ejecución.
+
+### «Response was truncated before completion»
+
+Revisa el límite que envió el cliente y `last_inference.finish_reason`. Un motivo `length`, `max_tokens` o un estado Responses `incomplete` indica un presupuesto agotado. El streaming no elimina esos límites. Reduce el historial o ajusta la salida dejando espacio para la entrada.
+
+### Backend equivocado o modelo no encontrado
+
+Comprueba `models/onram-launch.json` y `/v1/models`. La ruta nativa debe usar `--backend nram` y el alias `athenea-e2b:latest`. Los argumentos explícitos de arranque pueden sustituir el perfil.
+
+Sin el perfil local, otras rutas heredadas pueden seleccionar otro backend. Completa el paso de creación del perfil antes de utilizar el arranque automático.
+
+### Node.js o CHL no disponibles
+
+Comprueba `ONRAM_NODE`, el checkout `third_party/chl` y el resultado de `episodic_memory.py recall`. `ONRAM_CHL_REPO` permite apuntar a otro checkout. La ausencia del complemento nativo no exige desactivar la memoria: existe la alternativa JavaScript.
+
+### Cliente de agente ausente
+
+Un mensaje como `` `claude` was not found on PATH `` indica que falta el cliente o su ruta, no los pesos del E2B. Instala o localiza ese programa y vuelve a ejecutar `atenhea launch ...`.
+
+## Pruebas
+
+Una selección de pruebas del backend nativo, protocolos, memoria y entrenamiento:
+
+```sh
+.venv/bin/python -m unittest \
+  test_inference_settings test_agent_native test_native_runtime \
+  test_micro_extensions test_world_memory test_nram_low_memory \
+  test_trainable_download test_nram_generic test_nram_evolve_generic \
+  test_nram_container test_self_training test_self_improvement \
+  test_episodic_memory test_onram_memory test_runtime_attribution \
+  test_onram test_strata_backend -q
+```
+
+Las pruebas CHL necesitan su checkout y Node.js; algunas pruebas de tokenizador requieren el checkpoint local. Las pruebas de API abren sockets de loopback. Los resultados omitidos por dependencias ausentes deben distinguirse de pruebas ejecutadas y aprobadas.
+
+La verificación local también ha incluido sesiones reales de Pi y Codex, transferencia SSE incremental, reutilización del mismo PID y liberación del motor tras cancelar una respuesta. Son comprobaciones funcionales; no constituyen una evaluación general de precisión.
+
+Los comandos heredados `nram`, `nram-eval`, `nram-sweep`, `nram-memory`, `nram-adapt` y `nram-prepare-data` apuntan a un paquete hermano `nra_m` del workspace original. Ese paquete no se incluye en una clonación independiente de este repositorio; las pruebas que lo exigen pueden fallar aunque la ruta nativa E2B esté instalada.
+
+## Organización del proyecto
+
+| Ruta | Contenido |
+| --- | --- |
+| `atenhea`, `build_onram.sh`, `onram_launcher.c` | Comando y lanzador compilado. |
+| `onram_cli.py` | Despacho de comandos y arranque de agentes. |
+| `onram.py` | Proxy público, integración de memoria y API de administración. |
+| `native_runtime.py`, `native_protocol.py` | Inferencia nativa, streaming y adaptación de protocolos. |
+| `nram_container.py`, `nram_generic.py`, `nram_convert.py` | Contenedor, adaptadores y conversión desde el checkpoint. |
+| `micro_extensions.py`, `micro_training.py` | Microexpertos y entrenamiento sobre características cacheadas. |
+| `episodic_memory.py`, `integrations/chl_bridge.cjs` | Puente de memoria CHL. |
+| `world_memory.py` | Registros explícitos de hechos y eventos. |
+| `inference_settings.py` | Preferencia de explicación breve, modificable sin recarga. |
+| `self_improvement.py`, `rsi_loop.py` | Preparación documental y rondas candidatas LoRA. |
+| `docs/athenea-capabilities.json` | Capacidades y límites que se incorporan al autoconocimiento documental. |
+| `models/` | Pesos, perfiles, memorias, extensiones y candidatos locales; ignorado por Git. |
+| `third_party/` | Dependencias descargadas, incluido CHL; ignorado por Git. |
+
+### Rutas experimentales conservadas
+
+El repositorio también contiene adaptadores y herramientas para llama.cpp/GGUF, Strata, modelos distintos del E2B y mediciones de SSD/Metal. Se seleccionan explícitamente y no son necesarios para la instalación nativa descrita aquí.
+
+Consulta `atenhea --help` y la ayuda de cada subcomando. El trabajo de almacenamiento está descrito en [docs/apple-ssd-performance.md](docs/apple-ssd-performance.md). Sus resultados y los de otros modelos no deben atribuirse a la velocidad de inferencia o entrenamiento del E2B.
+
+Los pesos del modelo y CHL pertenecen a sus respectivos proyectos y condiciones de distribución. Esta instalación no redistribuye el checkpoint ni una memoria personal entrenada.
